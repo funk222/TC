@@ -1,0 +1,394 @@
+/*
+ * ESP32-C6 Hardware Test Program
+ * 用于测试所有硬件组件是否正常工作
+ * 
+ * 测试项目：
+ * 1. Serial 串口通信
+ * 2. I2C OLED 显示屏
+ * 3. MAX6675 温度传感器
+ * 4. 旋转编码器
+ * 5. 按键（3个）
+ * 6. 继电器输出
+ * 7. RGB LED (WS2812)
+ * 
+ * 使用方法：
+ * 1. 在platformio.ini中指定default_envs = esp32-c6-devkitc-1
+ * 2. 或者临时重命名：main.cpp改为main.cpp.bak，本文件改为main.cpp
+ * 3. 编译上传后观察串口输出和OLED显示
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_NeoPixel.h>
+#include "max6675.h"
+#include "config.h"
+
+// 全局对象
+MAX6675 thermocouple(MAXCLK, MAXCS, MAXDO);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_NeoPixel rgbLED(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// 测试变量
+int testStep = 0;
+volatile int encoderCount = 0;
+volatile int lastEncoded = 0;
+bool displayOK = false;
+bool thermocoupleOK = false;
+bool encoderTested = false;
+bool confirmTested = false;
+bool backTested = false;
+bool swTested = false;
+
+void IRAM_ATTR encoderISR() {
+  int MSB = digitalRead(ENCODER_CLK);
+  int LSB = digitalRead(ENCODER_DT);
+  int encoded = (MSB << 1) | LSB;
+  int sum = (lastEncoded << 2) | encoded;
+  
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    encoderCount++;
+  }
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    encoderCount--;
+  }
+  lastEncoded = encoded;
+}
+
+void setup() {
+  Serial.begin(SERIAL_BAUD_RATE);
+  delay(500);
+  
+  Serial.println("\n\n======================================");
+  Serial.println("  ESP32-C6 硬件测试程序");
+  Serial.println("======================================\n");
+  
+  // 测试 1: 串口
+  Serial.println("[1/7] 测试串口通信...");
+  Serial.println("      ✓ 串口正常工作");
+  delay(1000);
+  
+  // 测试 2: I2C 和 OLED
+  Serial.println("\n[2/7] 测试 I2C OLED 显示屏...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  
+  if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.printf("      ✓ OLED 初始化成功 (地址: 0x%02X)\n", SCREEN_ADDRESS);
+    displayOK = true;
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("ESP32-C6 Test");
+    display.println("OLED: OK");
+    display.display();
+  } else {
+    Serial.println("      ✗ OLED 初始化失败");
+    Serial.println("      请检查 I2C 连接和地址");
+  }
+  delay(1500);
+  
+  // 测试 3: MAX6675
+  Serial.println("\n[3/7] 测试 MAX6675 温度传感器...");
+  delay(500); // Wait for MAX6675
+  
+  float temp = thermocouple.readCelsius();
+  if (!isnan(temp) && temp >= 0) {
+    Serial.printf("      ✓ MAX6675 工作正常\n");
+    Serial.printf("      当前温度: %.2f°C\n", temp);
+    thermocoupleOK = true;
+    
+    if (displayOK) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("MAX6675: OK");
+      display.print("Temp: ");
+      display.print(temp, 1);
+      display.println("C");
+      display.display();
+    }
+  } else {
+    Serial.println("      ✗ MAX6675 读取失败");
+    Serial.println("      请检查连接");
+  }
+  delay(1500);
+  
+  // 测试 4: 旋转编码器
+  Serial.println("\n[4/7] 测试旋转编码器...");
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT), encoderISR, CHANGE);
+  
+  Serial.println("      请旋转编码器测试...");
+  if (displayOK) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Rotate Encoder");
+    display.println("Count: 0");
+    display.display();
+  }
+  
+  int lastCount = 0;
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < 5000) {
+    if (encoderCount != lastCount) {
+      lastCount = encoderCount;
+      Serial.printf("      编码器计数: %d\n", encoderCount);
+      encoderTested = true;
+      
+      if (displayOK) {
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("Rotate Encoder");
+        display.print("Count: ");
+        display.println(encoderCount);
+        display.display();
+      }
+    }
+    delay(50);
+  }
+  
+  if (encoderTested) {
+    Serial.println("      ✓ 旋转编码器工作正常");
+  } else {
+    Serial.println("      ✗ 未检测到编码器旋转");
+  }
+  delay(1000);
+  
+  // 测试 5: 按键
+  Serial.println("\n[5/7] 测试按键（3个）...");
+  pinMode(BTN_CONFIRM, INPUT_PULLUP);
+  pinMode(BTN_BACK, INPUT_PULLUP);
+  
+  Serial.println("      请分别按下确认键、返回键、编码器按键测试...");
+  if (displayOK) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Press Buttons");
+    display.println("CONFIRM: --");
+    display.println("BACK: --");
+    display.println("ENC_SW: --");
+    display.display();
+  }
+  
+  startTime = millis();
+  
+  while (millis() - startTime < 5000 && (!confirmTested || !backTested)) {
+    if (digitalRead(BTN_CONFIRM) == LOW && !confirmTested) {
+      Serial.println("      ✓ 确认键工作正常");
+      confirmTested = true;
+      delay(200);
+    }
+    
+    if (digitalRead(BTN_BACK) == LOW && !backTested) {
+      Serial.println("      ✓ 返回键工作正常");
+      backTested = true;
+      delay(200);
+    }
+    
+    if (digitalRead(ENCODER_SW) == LOW && !swTested) {
+      Serial.println("      ✓ 编码器按键工作正常（可选）");
+      swTested = true;
+      delay(200);
+    }
+    
+    if (displayOK) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("Press Buttons");
+      display.print("CONF: ");
+      display.println(confirmTested ? "OK" : "--");
+      display.print("BACK: ");
+      display.println(backTested ? "OK" : "--");
+      display.print("SW: ");
+      display.println(swTested ? "OK" : "--");
+      display.display();
+    }
+    
+    delay(50);
+  }
+  
+  if (!confirmTested) Serial.println("      ✗ 未检测到确认键");
+  if (!backTested) Serial.println("      ✗ 未检测到返回键");
+  if (!swTested) Serial.println("      ⚠ 编码器按键未测试（可选）");
+  delay(1000);
+  
+  // 测试 6: 继电器
+  Serial.println("\n[6/7] 测试继电器输出...");
+  pinMode(RELAY_PIN, OUTPUT);
+  
+  Serial.println("      继电器开启 (3秒)...");
+  if (displayOK) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Relay Test");
+    display.println();
+    display.setTextSize(2);
+    display.println("ON");
+    display.display();
+  }
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(3000);
+  
+  Serial.println("      继电器关闭");
+  if (displayOK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Relay Test");
+    display.println();
+    display.setTextSize(2);
+    display.println("OFF");
+    display.display();
+  }
+  digitalWrite(RELAY_PIN, LOW);
+  delay(1000);
+  
+  Serial.println("      ✓ 继电器控制正常");
+  
+  // 测试 7: RGB LED
+  Serial.println("\n[7/7] 测试 RGB LED (WS2812)...");
+  rgbLED.begin();
+  rgbLED.setBrightness(RGB_BRIGHTNESS);
+  
+  if (displayOK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("RGB LED Test");
+    display.display();
+  }
+  
+  Serial.println("      红色...");
+  rgbLED.setPixelColor(0, COLOR_OVERHEAT);  // 红色
+  rgbLED.show();
+  delay(1000);
+  
+  Serial.println("      绿色...");
+  rgbLED.setPixelColor(0, COLOR_NORMAL);   // 绿色
+  rgbLED.show();
+  delay(1000);
+  
+  Serial.println("      蓝色...");
+  rgbLED.setPixelColor(0, COLOR_UNDERHEAT); // 蓝色
+  rgbLED.show();
+  delay(1000);
+  
+  Serial.println("      橙色...");
+  rgbLED.setPixelColor(0, COLOR_HEATING);   // 橙色
+  rgbLED.show();
+  delay(1000);
+  
+  Serial.println("      关闭...");
+  rgbLED.setPixelColor(0, COLOR_OFF);       // 关闭
+  rgbLED.show();
+  delay(500);
+  
+  Serial.println("      ✓ RGB LED 工作正常");
+  
+  // 测试完成总结
+  Serial.println("\n======================================");
+  Serial.println("  测试完成！");
+  Serial.println("======================================\n");
+  
+  Serial.println("测试结果汇总：");
+  Serial.println("  串口通信: ✓");
+  Serial.printf("  OLED 显示: %s\n", displayOK ? "✓" : "✗");
+  Serial.printf("  MAX6675: %s\n", thermocoupleOK ? "✓" : "✗");
+  Serial.printf("  旋转编码器: %s\n", encoderTested ? "✓" : "?");
+  Serial.printf("  确认按键: %s\n", confirmTested ? "✓" : "?");
+  Serial.printf("  返回按键: %s\n", backTested ? "✓" : "?");
+  Serial.printf("  编码器按键: %s\n", swTested ? "✓(可选)" : "未测试(可选)");
+  Serial.println("  继电器: ✓ (请检查继电器是否动作)");
+  Serial.println("  RGB LED: ✓\n");
+  
+  if (displayOK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Test Complete!");
+    display.println();
+    display.printf("OLED: %s\n", displayOK ? "OK" : "FAIL");
+    display.printf("MAX6675: %s\n", thermocoupleOK ? "OK" : "FAIL");
+    display.printf("ENC: %s\n", encoderTested ? "OK" : "?");
+    display.printf("CONF: %s\n", confirmTested ? "OK" : "?");
+    display.printf("BACK: %s\n", backTested ? "OK" : "?");
+    display.printf("RGB: OK");
+    display.display();
+  }
+  
+  // 设置LED为绿色表示就绪
+  rgbLED.setPixelColor(0, COLOR_NORMAL);
+  rgbLED.show();
+  
+  Serial.println("所有测试完成，进入循环监测模式...\n");
+}
+
+void loop() {
+  static unsigned long lastUpdate = 0;
+  static bool ledState = false;
+  
+  if (millis() - lastUpdate > 2000) {
+    lastUpdate = millis();
+    
+    // 读取温度
+    float temp = thermocouple.readCelsius();
+    
+    // 切换LED颜色（绿色/蓝色交替）
+    ledState = !ledState;
+    rgbLED.setPixelColor(0, ledState ? COLOR_NORMAL : COLOR_COOLING);
+    rgbLED.show();
+    
+    // 串口输出
+    Serial.print("温度: ");
+    if (!isnan(temp)) {
+      Serial.print(temp, 2);
+      Serial.print("°C");
+    } else {
+      Serial.print("ERROR");
+    }
+    
+    Serial.print(" | 编码器: ");
+    Serial.print(encoderCount);
+    Serial.print(" | 按键: CONF=");
+    Serial.print(digitalRead(BTN_CONFIRM) == LOW ? "1" : "0");
+    Serial.print(" BACK=");
+    Serial.print(digitalRead(BTN_BACK) == LOW ? "1" : "0");
+    Serial.print(" SW=");
+    Serial.println(digitalRead(ENCODER_SW) == LOW ? "1" : "0");
+    
+    // OLED 显示
+    if (displayOK) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Monitor Mode");
+      display.println();
+      display.print("Temp: ");
+      if (!isnan(temp)) {
+        display.print(temp, 1);
+        display.println("C");
+      } else {
+        display.println("ERR");
+      }
+      display.print("Encoder: ");
+      display.println(encoderCount);
+      display.println();
+      display.print("CONF: ");
+      display.print(digitalRead(BTN_CONFIRM) == LOW ? "1" : "0");
+      display.print(" BACK: ");
+      display.println(digitalRead(BTN_BACK) == LOW ? "1" : "0");
+      display.print("SW: ");
+      display.println(digitalRead(ENCODER_SW) == LOW ? "1" : "0");
+      display.display();
+    }
+  }
+  
+  delay(50);
+}

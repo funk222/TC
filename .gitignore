@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+
+# Python env/cache (if any)
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
