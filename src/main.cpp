@@ -173,6 +173,7 @@ void handleWebRoot();
 void handleWebStatus();
 void handleWebControl();
 void handleWebLogDownload();
+void handleWebLogClear();
 void handleWebAuthState();
 void handleWebAuthSetup();
 void handleWebAuthLogin();
@@ -888,6 +889,7 @@ void setupWebServer() {
   webServer.on("/api/settings/update", HTTP_POST, handleWebSettingsUpdate);
   webServer.on("/api/control", HTTP_GET, handleWebControl);
   webServer.on("/logs/download", HTTP_GET, handleWebLogDownload);
+  webServer.on("/api/logs/clear", HTTP_POST, handleWebLogClear);
   webServer.onNotFound([]() {
     webServer.send(404, "text/plain", "Not Found");
   });
@@ -970,6 +972,7 @@ void handleWebRoot() {
     </div>
     <div class="row">
       <a href="/logs/download" download>Download Logs</a>
+      <button onclick="clearLogs()">Clear Logs</button>
       <button onclick="logout()">Logout</button>
       <span id="opResult"></span>
     </div>
@@ -1139,6 +1142,14 @@ void handleWebRoot() {
       document.getElementById('opResult').textContent = data.message || 'OK';
       await refreshStatus();
       await loadSettings();
+    }
+
+    async function clearLogs() {
+      const yes = window.confirm('Clear all logs now?');
+      if (!yes) return;
+      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || 'OK';
     }
 
     checkAuth();
@@ -1343,6 +1354,20 @@ void handleWebLogDownload() {
   webServer.sendHeader("Content-Disposition", "attachment; filename=status.csv");
   webServer.streamFile(file, "text/plain");
   file.close();
+}
+
+void handleWebLogClear() {
+  if (!ensureAuthenticated()) return;
+
+  if (LittleFS.exists(LOG_FILE_PATH)) {
+    LittleFS.remove(LOG_FILE_PATH);
+  }
+  if (LittleFS.exists(LOG_OLD_FILE_PATH)) {
+    LittleFS.remove(LOG_OLD_FILE_PATH);
+  }
+
+  lastWebLogWriteMs = millis();
+  webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"Logs cleared\"}");
 }
 
 AuthClientState* getAuthClientState(const String& ip, bool createIfMissing) {

@@ -128,6 +128,7 @@ pio device monitor
 - 控制接口：`/api/control?sys=on|off|toggle`、`/api/control?target=xx.x`
 - 设置接口：`/api/settings`、`/api/settings/update`（含 `hys/low/high/t2max/t2hy/scrsv/scrtm`）
 - 日志下载：`http://<设备IP>/logs/download`
+- 手动清除日志：网页 `Clear Logs` 按钮（`POST /api/logs/clear`）
 - 日志策略：当日志文件过大时自动轮转，当前日志为 `status.csv`
 - 日志字段（CSV）：`timestamp,T1,T1set,T2,Heat`
 
