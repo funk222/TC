@@ -69,7 +69,7 @@
 #define HYSTERESIS_ADJUST_STEP 0.1  // Hysteresis adjust step
 #define DEFAULT_SAFE_LOWER_TEMP  0.0    // Default lower safety boundary (°C)
 #define DEFAULT_SAFE_UPPER_TEMP  MAX_SAFE_TEMP // Default upper safety boundary (°C)
-#define SAFETY_BOUNDARY_MIN     15.0   // Hard minimum boundary value
+#define SAFETY_BOUNDARY_MIN     5.0   // Hard minimum boundary value
 #define SAFETY_BOUNDARY_MAX     95.0   // Hard maximum boundary value
 #define SAFETY_BOUNDARY_STEP      1.0   // Safety boundary adjust step (°C)
 #define MIN_SAFE_RANGE_GAP        5.0   // Minimum gap between lower and upper boundary (°C)

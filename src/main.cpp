@@ -55,9 +55,16 @@ bool systemEnabled = true;
 enum MenuState {
   MENU_MAIN,          // 首页状态显示
   MENU_POPUP,         // 弹出菜单
+  MENU_CONFIRM_ACTION,// 二级确认菜单
   MENU_SET_TARGET,    // 设置目标温度
   MENU_SYSTEM_CONTROL,// 系统开关控制
   MENU_SETTINGS       // 设置菜单
+};
+
+enum PendingAction {
+  ACTION_NONE,
+  ACTION_TOGGLE_SYS,
+  ACTION_FACTORY_RESET
 };
 
 MenuState currentMenu = MENU_MAIN;
@@ -65,6 +72,7 @@ int menuSelection = 0;
 int settingsSelection = 0;
 bool settingsEditing = false;
 int mainScrollOffset = 0;
+PendingAction pendingAction = ACTION_NONE;
 
 const int MAIN_TOTAL_LINES = 5;
 
@@ -108,6 +116,7 @@ void controlHeater();
 void updateDisplay();
 void drawMainMenu();
 void drawPopupMenu();
+void drawConfirmActionMenu();
 void drawSetTargetMenu();
 void drawSystemControlMenu();
 void handleMenuNavigation();
@@ -117,6 +126,7 @@ void updateLEDStatus();
 void sanitizeRuntimeSettings();
 void loadSettings();
 void saveSettings();
+void factoryResetSettings();
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
@@ -282,17 +292,36 @@ void handleButtons() {
           // 在弹出菜单执行操作
           if (menuSelection == 0) currentMenu = MENU_SET_TARGET;
           else if (menuSelection == 1) {
-            systemEnabled = !systemEnabled;
-            saveSettings();
-            #if ENABLE_SERIAL_DEBUG
-            Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
-            #endif
+            pendingAction = ACTION_TOGGLE_SYS;
+            currentMenu = MENU_CONFIRM_ACTION;
           }
           else if (menuSelection == 2) {
             currentMenu = MENU_SETTINGS;
             settingsSelection = 0;
             settingsEditing = false;
           }
+          else if (menuSelection == 3) {
+            pendingAction = ACTION_FACTORY_RESET;
+            currentMenu = MENU_CONFIRM_ACTION;
+          }
+          break;
+
+        case MENU_CONFIRM_ACTION:
+          if (pendingAction == ACTION_TOGGLE_SYS) {
+            systemEnabled = !systemEnabled;
+            saveSettings();
+            #if ENABLE_SERIAL_DEBUG
+            Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
+            #endif
+            currentMenu = MENU_POPUP;
+          } else if (pendingAction == ACTION_FACTORY_RESET) {
+            factoryResetSettings();
+            #if ENABLE_SERIAL_DEBUG
+            Serial.println("已恢复出厂设置");
+            #endif
+            currentMenu = MENU_MAIN;
+          }
+          pendingAction = ACTION_NONE;
           break;
 
         case MENU_SET_TARGET:
@@ -341,6 +370,9 @@ void handleButtons() {
         if (currentMenu == MENU_SETTINGS && settingsEditing) {
           settingsEditing = false;
           saveSettings();
+        } else if (currentMenu == MENU_CONFIRM_ACTION) {
+          pendingAction = ACTION_NONE;
+          currentMenu = MENU_POPUP;
         } else if (currentMenu == MENU_POPUP) {
           currentMenu = MENU_MAIN;
         } else {
@@ -384,8 +416,8 @@ void handleMenuNavigation() {
       case MENU_POPUP:
         // 弹出菜单导航
         menuSelection += delta;
-        if (menuSelection < 0) menuSelection = 2;
-        if (menuSelection > 2) menuSelection = 0;
+        if (menuSelection < 0) menuSelection = 3;
+        if (menuSelection > 3) menuSelection = 0;
         break;
         
       case MENU_SET_TARGET:
@@ -551,6 +583,26 @@ void saveSettings() {
   settingsStore.end();
 }
 
+void factoryResetSettings() {
+  settingsStore.begin(SETTINGS_NAMESPACE, false);
+  settingsStore.clear();
+  settingsStore.end();
+
+  targetTemp = DEFAULT_TARGET_TEMP;
+  tempHysteresis = TEMP_HYSTERESIS;
+  safetyLowerTemp = DEFAULT_SAFE_LOWER_TEMP;
+  safetyUpperTemp = DEFAULT_SAFE_UPPER_TEMP;
+  systemEnabled = true;
+
+  settingsSelection = 0;
+  settingsEditing = false;
+  menuSelection = 0;
+  mainScrollOffset = 0;
+
+  sanitizeRuntimeSettings();
+  saveSettings();
+}
+
 void updateDisplay() {
   display.clearDisplay();
   
@@ -560,6 +612,9 @@ void updateDisplay() {
       break;
     case MENU_POPUP:
       drawPopupMenu();
+      break;
+    case MENU_CONFIRM_ACTION:
+      drawConfirmActionMenu();
       break;
     case MENU_SET_TARGET:
       drawSetTargetMenu();
@@ -622,9 +677,28 @@ void drawPopupMenu() {
                     ? (systemEnabled ? "> SYS: ON" : "> SYS: OFF")
                     : (systemEnabled ? "  SYS: ON" : "  SYS: OFF"));
   display.println(menuSelection == 2 ? "> Settings" : "  Settings");
+  display.println(menuSelection == 3 ? "> Factory Reset" : "  Factory Reset");
   display.println();
   display.println(F("SW: Select/Toggle"));
   display.println(F("BACK: Close"));
+}
+
+void drawConfirmActionMenu() {
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(F("=== CONFIRM ==="));
+  display.println();
+
+  if (pendingAction == ACTION_TOGGLE_SYS) {
+    display.println(systemEnabled ? F("Turn SYS OFF ?") : F("Turn SYS ON ?"));
+  } else if (pendingAction == ACTION_FACTORY_RESET) {
+    display.println(F("Factory Reset ?"));
+    display.println(F("(clear saved cfg)"));
+  }
+
+  display.println();
+  display.println(F("SW: YES"));
+  display.println(F("BACK: NO"));
 }
 
 void drawSetTargetMenu() {
