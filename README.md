@@ -1,229 +1,134 @@
 # ESP32-C6 Temperature Controller
 
-基于 nanoESP32-C6 v1.0 的温度控制器项目
+基于 nanoESP32-C6 v1.0 的双传感器温控项目（MAX6675 + MAX31865 PT100）。
 
-## 🎯 项目特点
+## 🎯 当前功能
 
-- ✅ **精确温控** - MAX6675热电偶，0-1024°C测量范围
-- ✅ **直观显示** - I2C OLED (128x64) 实时显示温度和状态
-- ✅ **便捷操作** - 旋转编码器+2个独立按键（编码器SW可选）
-- ✅ **智能报警** - WS2812 RGB LED颜色指示系统状态
-- ✅ **安全保护** - 过温保护，自动断电
-- ✅ **滞后控制** - ±2°C滞后带，避免频繁开关
+- ✅ 主温度传感器：MAX6675（用于控制）
+- ✅ 第二温度传感器：MAX31865 + PT100（安全联锁）
+- ✅ SSR 控制联锁：仅当第二传感器温度 `< 150°C` 时，第一传感器才允许控制 SSR
+- ✅ OLED 实时显示（首页大字体温度 + 状态区）
+- ✅ 菜单防误按：二级确认菜单
+- ✅ Factory Reset：清空保存参数并恢复默认
+- ✅ 参数持久化：目标温度/滞后/安全上下限保存到 NVS
+- ✅ 重启策略：系统重启后 `SYS` 固定为 `ON`
+- ✅ 屏幕保护：无操作自动息屏，支持在 Settings 开关并保存
+- ✅ RGB LED 报警序列
 
 ## 📦 硬件需求
 
-### 主控板
-- **nanoESP32-C6 v1.0** (ESP32-C6)
-- 板载WS2812 RGB LED (GPIO 8)
+- nanoESP32-C6 v1.0
+- MAX6675 + K 型热电偶
+- MAX31865 + PT100
+- SSD1306 OLED（I2C）
+- SSR/继电器（加热输出）
+- 旋转编码器（CLK/DT/SW）
+- 两个按键（Menu / Back）
 
-### 传感器和执行器
-- MAX6675 热电偶模块 (K型)
-- SSD1306 OLED显示屏 (128x64, I2C)
-- 继电器模块 (5V/3.3V)
+## 🔌 引脚分配（当前）
 
-### 输入设备
-- 旋转编码器 (KY-040或类似，SW按键可不接)
-- 2个独立按键 (确认+返回)
+| GPIO | 功能 |
+|------|------|
+| 4 | MAX6675 SO |
+| 5 | MAX6675 CS |
+| 6 | MAX6675 SCK |
+| 7 | SSR 输出 |
+| 8 | 板载 WS2812 RGB |
+| 10 | 编码器 CLK |
+| 11 | 编码器 DT |
+| 12 | Menu 键（打开弹出菜单） |
+| 13 | Back 键 |
+| 21 | 编码器 SW（确认/执行） |
+| 22 | I2C SDA（OLED） |
+| 23 | I2C SCL（OLED） |
+| 9 | MAX31865 CS |
+| 15 | MAX31865 MOSI |
+| 4 | MAX31865 MISO（与 MAX6675 SO 共用） |
+| 6 | MAX31865 SCK（与 MAX6675 SCK 共用） |
 
-## 🔌 引脚连接
+## 🧠 控制逻辑
 
-| GPIO | 功能 | 说明 |
-|------|------|------|
-| 4 | MAX6675 SO | 数据输出 |
-| 5 | MAX6675 CS | 片选 |
-| 6 | MAX6675 SCK | 时钟 |
-| 7 | 继电器 IN | 控制输出 |
-| **8** | **RGB LED** | **板载WS2812** ⭐ |
-| 10 | 编码器 CLK | 旋转检测A |
-| 11 | 编码器 DT | 旋转检测B |
-| 12 | 确认按键 | 主要操作键 |
-| 13 | 返回按键 | 返回/取消 |
-| - | 编码器 SW | 可选按键（默认不接） |
-| **22** | **I2C SDA** | OLED数据 ⚠️ |
-| **23** | **I2C SCL** | OLED时钟 ⚠️ |
+1. 第一传感器 `T1`（MAX6675）负责温控滞后算法。
+2. 第二传感器 `T2`（PT100）负责联锁：
+   - `T2 >= 150°C` 或读取无效 → 强制关闭 SSR
+   - `T2 < 150°C` 且有效 → 允许 T1 控制 SSR
+3. 安全边界：当前温度超出 `[Low, High]` 会触发保护并关闭系统。
 
-⚠️ **重要提示**：I2C引脚已从GPIO 8/9更改为GPIO 22/23，避免与板载RGB LED冲突。
+## 🎛️ 菜单操作（当前交互）
 
-## 🚀 快速开始
+### 首页
+- 显示大字体温度（当前/设定）与状态信息
+- `Menu` 键（GPIO12）打开弹出菜单
 
-### 1. 安装PlatformIO
+### 弹出菜单
+- 旋钮选择条目，`SW` 执行
+- 包含：
+  - `Set Target`
+  - `SYS: ON/OFF`
+  - `Settings`
+  - `Factory Reset`
 
-- VS Code + PlatformIO Extension
-- 或使用PlatformIO CLI
+### 二级确认（防误按）
+- 对 `SYS` 切换和 `Factory Reset` 进入确认页
+- `SW: YES`，`BACK: NO`
 
-### 2. 克隆/打开项目
+### Settings
+- 可调参数：
+  - `Hys`
+  - `Low`
+  - `High`
+  - `T2Mx`
+  - `T2Hy`
+  - `ScrSv`（屏保开关）
+- `SW` 进入/退出编辑
+- 参数会自动持久化到 NVS
 
-```bash
-cd D:\ESP32-C6-TempController
-code .
-```
+## 💾 持久化与重启行为
 
-### 3. 编译项目
+保存到 NVS 的参数：
+- `targetTemp`
+- `tempHysteresis`
+- `safetyLowerTemp`
+- `safetyUpperTemp`
+- `secondaryTempLimit`
+- `secondaryTempHysteresis`
+- `screenSaverEnabled`
+
+重启后：
+- 上述参数会恢复
+- `systemEnabled` 强制设为 `ON`
+
+## 🎨 LED 状态
+
+- 高温报警：红闪两下 + 蓝闪一下（循环）
+- 低温报警：蓝闪两下 + 红闪一下（循环）
+- 传感器错误：紫色闪烁
+- 加热中：橙色/红色状态指示（按当前逻辑）
+
+## 🚀 构建与上传
 
 ```bash
 pio run -e esp32-c6-devkitc-1
-```
-
-### 4. 上传固件
-
-```bash
 pio run -e esp32-c6-devkitc-1 -t upload
-```
-
-### 5. 查看串口输出
-
-```bash
 pio device monitor
 ```
 
-## 📋 依赖库
+## 📚 依赖库
 
-所有库已在 `platformio.ini` 中配置，PlatformIO会自动下载：
+由 PlatformIO 自动安装（见 `platformio.ini`）：
+- adafruit/MAX6675 library
+- adafruit/Adafruit MAX31865 library
+- adafruit/Adafruit GFX Library
+- adafruit/Adafruit SSD1306
+- adafruit/Adafruit BusIO
+- adafruit/Adafruit NeoPixel
 
-- Adafruit MAX6675 library @ ^1.2.0
-- Adafruit GFX Library @ ^1.11.3
-- Adafruit SSD1306 @ ^2.5.7
-- Adafruit BusIO @ ^1.14.1
-- Adafruit NeoPixel @ ^1.10.7
+## 🧩 关键配置文件
 
-## 🎮 操作说明
+- `include/config.h`：引脚、阈值、间隔、默认参数
+- `src/main.cpp`：菜单、温控、联锁、报警、持久化逻辑
+- `platformio.ini`：板卡与库依赖
 
-### 主菜单
-- **旋转编码器** - 选择菜单项
-- **确认键** - 进入选中的菜单
-- **返回键** - 返回上级菜单
+## 📄 License
 
-### 设置目标温度
-1. 主菜单选择 "Set Target"
-2. 按确认键进入
-3. 旋转编码器调整温度 (±0.5°C/步)
-4. 按确认键保存
-
-### 系统控制
-1. 主菜单选择 "System Ctrl"
-2. 按确认键切换系统开/关
-
-## 🎨 LED状态指示
-
-| 状态 | 颜色 | 说明 |
-|------|------|------|
-| 正常待机 | 🟢 绿色 | 系统关闭 |
-| 加热中 | 🔴 红色 | 加热器工作 |
-| 保温待机 | 🟠 橙色 | 系统开启未加热 |
-| 过热报警 | 🔴 红闪 | 温度>350°C |
-| 传感器错误 | 💜 紫闪 | 读数异常 |
-
-## 🔧 硬件测试
-
-项目包含完整的硬件测试程序：
-
-### 运行测试
-1. 重命名文件：
-   ```
-   src/main.cpp → src/main.cpp.bak
-   src/test_hardware.cpp.disabled → src/main.cpp
-   ```
-2. 编译上传
-3. 查看串口输出和OLED显示
-
-### 测试项目
-- ✓ 串口通信
-- ✓ OLED显示
-- ✓ MAX6675温度传感器
-- ✓ 旋转编码器
-- ✓ 2个按键（编码器SW可选）
-- ✓ 继电器输出
-- ✓ RGB LED
-
-## 📁 项目结构
-
-```
-ESP32-C6-TempController/
-├── platformio.ini              # PlatformIO配置
-├── include/
-│   └── config.h                # 引脚和参数配置
-├── src/
-│   ├── main.cpp                # 主程序
-│   └── test_hardware.cpp.disabled  # 硬件测试程序
-├── docs/                       # 文档目录
-└── README.md                   # 本文件
-```
-
-## ⚙️ 配置参数
-
-在 `include/config.h` 中可调整：
-
-```cpp
-// 温度控制
-#define DEFAULT_TARGET_TEMP  25.0   // 默认目标温度
-#define TEMP_HYSTERESIS      2.0    // 控制滞后带
-#define MAX_TEMP             300.0  // 最大设定温度
-#define MAX_SAFE_TEMP        350.0  // 安全保护温度
-
-// RGB LED
-#define RGB_LED_BRIGHTNESS  50      // 亮度 (0-255)
-
-// 更新间隔
-#define TEMP_UPDATE_INTERVAL     500   // 温度读取间隔(ms)
-#define DISPLAY_UPDATE_INTERVAL  100   // 显示刷新间隔(ms)
-```
-
-## 🐛 故障排除
-
-### OLED不显示
-- 检查I2C接线 (SDA=GPIO22, SCL=GPIO23)
-- 尝试更改地址：`config.h` 中 `SCREEN_ADDRESS` (0x3C ↔ 0x3D)
-
-### MAX6675读取失败
-- 检查接线 (SO=4, CS=5, SCK=6)
-- 确认热电偶极性
-- 等待传感器稳定 (~1秒)
-
-### RGB LED不亮
-- 板载LED在GPIO 8，无需外接
-- 检查固件是否正确编译
-- 查看串口输出确认初始化
-
-### 编译错误
-- 确保PlatformIO已安装
-- 运行 `pio pkg install` 更新库
-- 清理项目：`pio run -t clean`
-
-## 📚  相关链接
-
-- [nanoESP32-C6官方仓库](https://github.com/wuxx/nanoESP32-C6)
-- [ESP32-C6官方文档](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/)
-- [PlatformIO文档](https://docs.platformio.org/)
-
-## 📝 版本历史
-
-### v1.2 - 2026-02-12
-- ✅ 修正RGB LED到GPIO 8（板载）
-- ✅ I2C更改到GPIO 22/23
-- ✅ 添加RGB LED报警功能
-- ✅ 完整硬件测试程序
-
-### v1.1 - 2026-02-12
-- ✅ 3个按键支持（2主要+1可选）
-- ✅ 改进菜单导航
-- ✅ 添加系统开关控制
-
-### v1.0 - 初始版本
-- ✅ 基础温度控制功能
-- ✅ OLED显示界面
-- ✅ 旋转编码器输入
-
-## 📄 许可证
-
-MIT License - 自由使用和修改
-
-## 🤝 贡献
-
-欢迎提交Issue和Pull Request！
-
----
-
-**项目路径**: `D:\ESP32-C6-TempController`  
-**最后更新**: 2026-02-12  
-**硬件版本**: nanoESP32-C6 v1.0
+MIT

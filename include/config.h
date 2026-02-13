@@ -19,6 +19,13 @@
 #define MAXCS   5   // CS pin (Chip Select)
 #define MAXCLK  6   // SCK pin (Serial Clock)
 
+// MAX31865 PT100 Interface (software SPI)
+// Use available pins and share SCK/MISO with MAX6675 to avoid unavailable GPIO16/17
+#define PT100_CS    9       // CS pin
+#define PT100_MOSI  15      // SDI pin
+#define PT100_MISO  MAXDO   // SDO pin (shared with MAX6675 SO)
+#define PT100_SCK   MAXCLK  // CLK pin (shared with MAX6675 SCK)
+
 // I2C OLED Display SSD1306 (2 pins)
 #define I2C_SDA 22  // Changed from GPIO 8 to avoid conflict with onboard RGB LED
 #define I2C_SCL 23  // Changed from GPIO 9
@@ -58,6 +65,8 @@
 #define SCREEN_HEIGHT   64
 #define OLED_RESET      -1
 #define SCREEN_ADDRESS  0x3C  // Some displays use 0x3D
+#define SCREEN_SAVER_ENABLED true
+#define SCREEN_SAVER_TIMEOUT_MS 60000  // Auto turn off display after inactivity (ms)
 
 // ========================
 // Temperature Control
@@ -76,6 +85,22 @@
 #define MIN_TEMP                 5// Minimum settable temp
 #define MAX_TEMP             95.0  // Maximum settable temp
 #define TEMP_ADJUST_STEP     0.5    // Adjustment step per encoder click
+
+// Second temperature sensor (MAX31865 + PT100)
+#define DEFAULT_SECOND_SENSOR_MAX_TEMP 150.0  // Interlock threshold default (°C)
+#define SECOND_SENSOR_HYSTERESIS        2.0    // Interlock hysteresis (°C), release at (T2Lim - Hys)
+#define MIN_SECOND_SENSOR_HYSTERESIS    0.0    // T2 hysteresis min (°C)
+#define MAX_SECOND_SENSOR_HYSTERESIS    20.0   // T2 hysteresis max (°C)
+#define SECOND_SENSOR_HYSTERESIS_STEP   0.1    // T2 hysteresis adjust step (°C)
+#define MIN_SECOND_SENSOR_MAX_TEMP     0.0  // Adjustable lower limit (°C)
+#define MAX_SECOND_SENSOR_MAX_TEMP     200.0  // Adjustable upper limit (°C)
+#define SECOND_SENSOR_MAX_STEP           1.0  // Adjustment step (°C)
+#define PT100_RNOMINAL       100.0    // PT100 nominal resistance at 0°C
+#define PT100_RREF           430.0    // Reference resistor value on MAX31865 board
+#define PT100_WIRES          3        // RTD wiring: 2/3/4
+#define PT100_FAULT_DEBOUNCE_COUNT 3  // Consecutive faults required before marking T2 invalid
+#define PT100_VALID_HOLD_MS    3000   // Keep last valid T2 for short contact glitches
+#define PT100_MAX_JUMP_PER_SAMPLE 12.0 // Reject unrealistic single-sample jump (°C)
 
 // ========================
 // Timing Parameters
