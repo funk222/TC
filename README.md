@@ -6,14 +6,17 @@
 
 - ✅ 主温度传感器：MAX6675（用于控制）
 - ✅ 第二温度传感器：MAX31865 + PT100（安全联锁）
-- ✅ SSR 控制联锁：仅当第二传感器温度 `< 150°C` 时，第一传感器才允许控制 SSR
+- ✅ SSR 控制联锁：T2 有效且超限时强制关断；T2 无效时允许 T1 继续控制
 - ✅ OLED 实时显示（首页大字体温度 + 状态区）
 - ✅ 菜单防误按：二级确认菜单
 - ✅ Factory Reset：清空保存参数并恢复默认
 - ✅ 参数持久化：目标温度/滞后/安全上下限保存到 NVS
 - ✅ 重启策略：系统重启后 `SYS` 固定为 `ON`
-- ✅ 屏幕保护：无操作自动息屏，支持在 Settings 开关并保存
+- ✅ 屏幕保护：支持开关与时长（`ScrTm`）设置，并保存到 NVS
 - ✅ RGB LED 报警序列
+- ✅ 内置网页状态页（实时显示 T1/T2/Heat/Sys）
+- ✅ 网页控制（SYS 开关、目标温度设置）+ 日志下载
+- ✅ 日志文件自动轮转（超大小自动删除旧日志）
 
 ## 📦 硬件需求
 
@@ -50,8 +53,8 @@
 
 1. 第一传感器 `T1`（MAX6675）负责温控滞后算法。
 2. 第二传感器 `T2`（PT100）负责联锁：
-   - `T2 >= 150°C` 或读取无效 → 强制关闭 SSR
-   - `T2 < 150°C` 且有效 → 允许 T1 控制 SSR
+  - `T2` 有效且 `T2 >= T2Mx` → 强制关闭 SSR
+  - `T2` 无效，或 `T2 < T2Mx` → 允许 T1 控制 SSR
 3. 安全边界：当前温度超出 `[Low, High]` 会触发保护并关闭系统。
 
 ## 🎛️ 菜单操作（当前交互）
@@ -80,8 +83,10 @@
   - `T2Mx`
   - `T2Hy`
   - `ScrSv`（屏保开关）
+  - `ScrTm`（屏保时长，秒）
 - `SW` 进入/退出编辑
 - 参数会自动持久化到 NVS
+- `ScrTm` 范围：10~600 秒（步进 10 秒）
 
 ## 💾 持久化与重启行为
 
@@ -93,6 +98,7 @@
 - `secondaryTempLimit`
 - `secondaryTempHysteresis`
 - `screenSaverEnabled`
+- `screenSaverTimeoutMs`
 
 重启后：
 - 上述参数会恢复
@@ -112,6 +118,25 @@ pio run -e esp32-c6-devkitc-1
 pio run -e esp32-c6-devkitc-1 -t upload
 pio device monitor
 ```
+
+## 🌐 网页状态页
+
+- 设备会以 STA 模式连接到 `include/config.h` 中配置的 `WIFI_SSID`
+- Wi-Fi 密码来自 `include/config.h` 中配置的 `WIFI_PASSWORD`
+- 上电后在串口日志查看 `IP`，浏览器访问：`http://<设备IP>/`
+- JSON 接口：`http://<设备IP>/api/status`
+- 控制接口：`/api/control?sys=on|off|toggle`、`/api/control?target=xx.x`
+- 设置接口：`/api/settings`、`/api/settings/update`（含 `hys/low/high/t2max/t2hy/scrsv/scrtm`）
+- 日志下载：`http://<设备IP>/logs/download`
+- 日志策略：当日志文件过大时自动轮转，当前日志为 `status.csv`
+- 日志字段（CSV）：`timestamp,T1,T1set,T2,Heat`
+
+### 🔐 网页安全访问
+
+- 第一次访问需先创建网页密码
+- 创建后必须登录，未登录或密码错误无法访问状态/设置/控制/日志下载
+- 同一访问 IP 连续输错 5 次密码，将被封禁 5 分钟
+- 登录后可在网页端修改设置参数并保存
 
 ## 📚 依赖库
 

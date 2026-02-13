@@ -23,6 +23,10 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <time.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
@@ -37,6 +41,9 @@ Adafruit_MAX31865 pt100Sensor(PT100_CS, PT100_MOSI, PT100_MISO, PT100_SCK);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_NeoPixel rgbLED(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 Preferences settingsStore;
+WebServer webServer(WEB_DASHBOARD_PORT);
+const char* LOG_FILE_PATH = "/status.csv";
+const char* LOG_OLD_FILE_PATH = "/status.old.csv";
 
 const char* SETTINGS_NAMESPACE = "tempctrl";
 const char* KEY_TARGET_TEMP = "target";
@@ -46,6 +53,20 @@ const char* KEY_SAFE_HIGH = "safe_high";
 const char* KEY_T2_MAX = "t2_max";
 const char* KEY_T2_HYS = "t2_hys";
 const char* KEY_SCREEN_SAVER = "scr_sav";
+const char* KEY_SCREEN_SAVER_TIMEOUT = "scr_to";
+const char* KEY_WEB_PASSWORD = "web_pwd";
+
+String webPassword = "";
+
+struct AuthClientState {
+  String ip;
+  uint8_t failCount;
+  unsigned long blockedUntilMs;
+  bool loggedIn;
+};
+
+const int MAX_AUTH_CLIENTS = 8;
+AuthClientState authClients[MAX_AUTH_CLIENTS];
 
 // 温度控制变量
 float currentTemp = 0.0;
@@ -59,7 +80,6 @@ float secondaryTempHysteresis = SECOND_SENSOR_HYSTERESIS;
 bool heaterOn = false;
 bool systemEnabled = true;
 bool secondarySensorValid = false;
-bool secondaryInterlockBlocked = false;
 bool safetyTripActive = false;
 uint8_t pt100FaultCount = 0;
 unsigned long lastPt100ValidMs = 0;
@@ -89,8 +109,10 @@ int mainScrollOffset = 0;
 PendingAction pendingAction = ACTION_NONE;
 bool screenSaverActive = false;
 bool screenSaverEnabled = SCREEN_SAVER_ENABLED;
+uint32_t screenSaverTimeoutMs = DEFAULT_SCREEN_SAVER_TIMEOUT_MS;
 unsigned long lastUserActivityMs = 0;
 int screenSaverEncoderPos = 0;
+unsigned long lastWebLogWriteMs = 0;
 
 const int MAIN_TOTAL_LINES = 4;
 
@@ -145,6 +167,32 @@ void sanitizeRuntimeSettings();
 void loadSettings();
 void saveSettings();
 void factoryResetSettings();
+void initWiFi();
+void setupWebServer();
+void handleWebRoot();
+void handleWebStatus();
+void handleWebControl();
+void handleWebLogDownload();
+void handleWebAuthState();
+void handleWebAuthSetup();
+void handleWebAuthLogin();
+void handleWebAuthLogout();
+void handleWebSettings();
+void handleWebSettingsUpdate();
+AuthClientState* getAuthClientState(const String& ip, bool createIfMissing);
+String getWebClientIp();
+bool isWebClientBlocked(const String& ip, unsigned long* remainingMs = nullptr);
+bool isWebClientLoggedIn(const String& ip);
+void markWebLoginFailure(const String& ip);
+void markWebLoginSuccess(const String& ip);
+void markWebLogout(const String& ip);
+bool ensureAuthenticated();
+String jsonEscape(const String& input);
+void rotateLogsIfNeeded();
+String formatLogTimestamp();
+void appendLogLine();
+void appendPeriodicStatusLog();
+void migrateLegacyLogFormatIfNeeded();
 
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
@@ -153,6 +201,12 @@ void setup() {
   Serial.println("ESP32-C6 温度控制器启动中...");
   Serial.println("=================================");
   #endif
+
+  LittleFS.begin(true);
+  migrateLegacyLogFormatIfNeeded();
+
+  initWiFi();
+  setupWebServer();
 
   loadSettings();
 
@@ -253,7 +307,7 @@ void loop() {
   }
 
   if (screenSaverEnabled && !screenSaverActive) {
-    if (currentMillis - lastUserActivityMs >= SCREEN_SAVER_TIMEOUT_MS) {
+    if (currentMillis - lastUserActivityMs >= screenSaverTimeoutMs) {
       screenSaverActive = true;
       display.ssd1306_command(SSD1306_DISPLAYOFF);
     }
@@ -288,6 +342,12 @@ void loop() {
     lastLEDUpdate = currentMillis;
     updateLEDStatus();
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    webServer.handleClient();
+  }
+
+  appendPeriodicStatusLog();
 }
 
 // 编码器中断服务程序
@@ -552,6 +612,12 @@ void handleMenuNavigation() {
           } else if (settingsSelection == 5) {
             // 屏幕保护开关
             if (delta != 0) screenSaverEnabled = !screenSaverEnabled;
+          } else if (settingsSelection == 6) {
+            // 屏幕保护时长（毫秒）
+            int32_t nextValue = static_cast<int32_t>(screenSaverTimeoutMs) + (delta * SCREEN_SAVER_TIMEOUT_STEP_MS);
+            if (nextValue < MIN_SCREEN_SAVER_TIMEOUT_MS) nextValue = MIN_SCREEN_SAVER_TIMEOUT_MS;
+            if (nextValue > MAX_SCREEN_SAVER_TIMEOUT_MS) nextValue = MAX_SCREEN_SAVER_TIMEOUT_MS;
+            screenSaverTimeoutMs = static_cast<uint32_t>(nextValue);
           }
 
           // 目标温度始终限制在安全范围内
@@ -564,8 +630,8 @@ void handleMenuNavigation() {
         } else {
           // 未编辑时，旋钮切换设置项
           settingsSelection += delta;
-          if (settingsSelection < 0) settingsSelection = 5;
-          if (settingsSelection > 5) settingsSelection = 0;
+          if (settingsSelection < 0) settingsSelection = 6;
+          if (settingsSelection > 6) settingsSelection = 0;
         }
         break;
     }
@@ -662,27 +728,13 @@ void readTemperature() {
 }
 
 void controlHeater() {
-  // 第二传感器联锁（带回差）：
-  // - T2 >= 上限时锁定切断
-  // - 锁定后需降到 (上限 - 回差) 才解除
-  // - T2 无效/报错时不参与控制，交由 T1 正常控制
-  if (secondarySensorValid) {
-    float t2ReleaseTemp = secondaryTempLimit - secondaryTempHysteresis;
-    if (secondaryInterlockBlocked) {
-      if (secondaryTemp <= t2ReleaseTemp) {
-        secondaryInterlockBlocked = false;
-      }
-    } else if (secondaryTemp >= secondaryTempLimit) {
-      secondaryInterlockBlocked = true;
-    }
-
-    if (secondaryInterlockBlocked) {
-      digitalWrite(RELAY_PIN, LOW);
-      heaterOn = false;
-      return;
-    }
-  } else {
-    secondaryInterlockBlocked = false;
+  // 第二传感器联锁：
+  // - T2 有效且 >= 上限：强制关闭 SSR
+  // - T2 有效且 < 上限，或 T2 无效：允许 T1 控制
+  if (secondarySensorValid && secondaryTemp >= secondaryTempLimit) {
+    digitalWrite(RELAY_PIN, LOW);
+    heaterOn = false;
+    return;
   }
 
   // 简单的滞后控制算法
@@ -705,6 +757,8 @@ void sanitizeRuntimeSettings() {
   if (secondaryTempHysteresis > MAX_SECOND_SENSOR_HYSTERESIS) secondaryTempHysteresis = MAX_SECOND_SENSOR_HYSTERESIS;
   if (secondaryTempLimit < MIN_SECOND_SENSOR_MAX_TEMP) secondaryTempLimit = MIN_SECOND_SENSOR_MAX_TEMP;
   if (secondaryTempLimit > MAX_SECOND_SENSOR_MAX_TEMP) secondaryTempLimit = MAX_SECOND_SENSOR_MAX_TEMP;
+  if (screenSaverTimeoutMs < MIN_SCREEN_SAVER_TIMEOUT_MS) screenSaverTimeoutMs = MIN_SCREEN_SAVER_TIMEOUT_MS;
+  if (screenSaverTimeoutMs > MAX_SCREEN_SAVER_TIMEOUT_MS) screenSaverTimeoutMs = MAX_SCREEN_SAVER_TIMEOUT_MS;
 
   if (safetyLowerTemp < SAFETY_BOUNDARY_MIN) safetyLowerTemp = SAFETY_BOUNDARY_MIN;
   if (safetyLowerTemp > SAFETY_BOUNDARY_MAX) safetyLowerTemp = SAFETY_BOUNDARY_MAX;
@@ -737,6 +791,8 @@ void loadSettings() {
   secondaryTempLimit = settingsStore.getFloat(KEY_T2_MAX, DEFAULT_SECOND_SENSOR_MAX_TEMP);
   secondaryTempHysteresis = settingsStore.getFloat(KEY_T2_HYS, SECOND_SENSOR_HYSTERESIS);
   screenSaverEnabled = settingsStore.getBool(KEY_SCREEN_SAVER, SCREEN_SAVER_ENABLED);
+  screenSaverTimeoutMs = settingsStore.getULong(KEY_SCREEN_SAVER_TIMEOUT, DEFAULT_SCREEN_SAVER_TIMEOUT_MS);
+  webPassword = settingsStore.getString(KEY_WEB_PASSWORD, "");
   settingsStore.end();
 
   // 按需求：重启后系统始终为 ON
@@ -745,7 +801,7 @@ void loadSettings() {
   sanitizeRuntimeSettings();
 
   #if ENABLE_SERIAL_DEBUG
-  Serial.printf("已加载设置: T=%.1f Hys=%.1f Low=%.1f High=%.1f T2Lim=%.1f T2Hys=%.1f ScrSav=%s Sys=%s\n",
+  Serial.printf("已加载设置: T=%.1f Hys=%.1f Low=%.1f High=%.1f T2Lim=%.1f T2Hys=%.1f ScrSav=%s ScrTm=%lus Sys=%s\n",
                 targetTemp,
                 tempHysteresis,
                 safetyLowerTemp,
@@ -753,6 +809,7 @@ void loadSettings() {
                 secondaryTempLimit,
                 secondaryTempHysteresis,
                 screenSaverEnabled ? "ON" : "OFF",
+                static_cast<unsigned long>(screenSaverTimeoutMs / 1000),
                 systemEnabled ? "ON" : "OFF");
   #endif
 }
@@ -768,6 +825,8 @@ void saveSettings() {
   settingsStore.putFloat(KEY_T2_MAX, secondaryTempLimit);
   settingsStore.putFloat(KEY_T2_HYS, secondaryTempHysteresis);
   settingsStore.putBool(KEY_SCREEN_SAVER, screenSaverEnabled);
+  settingsStore.putULong(KEY_SCREEN_SAVER_TIMEOUT, screenSaverTimeoutMs);
+  settingsStore.putString(KEY_WEB_PASSWORD, webPassword);
   settingsStore.end();
 }
 
@@ -783,6 +842,8 @@ void factoryResetSettings() {
   secondaryTempLimit = DEFAULT_SECOND_SENSOR_MAX_TEMP;
   secondaryTempHysteresis = SECOND_SENSOR_HYSTERESIS;
   screenSaverEnabled = SCREEN_SAVER_ENABLED;
+  screenSaverTimeoutMs = DEFAULT_SCREEN_SAVER_TIMEOUT_MS;
+  webPassword = "";
   systemEnabled = true;
 
   settingsSelection = 0;
@@ -792,6 +853,699 @@ void factoryResetSettings() {
 
   sanitizeRuntimeSettings();
   saveSettings();
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+  }
+
+  #if ENABLE_SERIAL_DEBUG
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected: %s | IP: %s\n", WIFI_SSID, WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("WiFi connect failed: %s\n", WIFI_SSID);
+  }
+  #endif
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  }
+}
+
+void setupWebServer() {
+  webServer.on("/", HTTP_GET, handleWebRoot);
+  webServer.on("/api/auth/state", HTTP_GET, handleWebAuthState);
+  webServer.on("/api/auth/setup", HTTP_POST, handleWebAuthSetup);
+  webServer.on("/api/auth/login", HTTP_POST, handleWebAuthLogin);
+  webServer.on("/api/auth/logout", HTTP_POST, handleWebAuthLogout);
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api/settings", HTTP_GET, handleWebSettings);
+  webServer.on("/api/settings/update", HTTP_POST, handleWebSettingsUpdate);
+  webServer.on("/api/control", HTTP_GET, handleWebControl);
+  webServer.on("/logs/download", HTTP_GET, handleWebLogDownload);
+  webServer.onNotFound([]() {
+    webServer.send(404, "text/plain", "Not Found");
+  });
+  webServer.begin();
+}
+
+void handleWebRoot() {
+  const char* html = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Temp Controller Status</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .card { background: #1b1b1b; border: 1px solid #333; border-radius: 8px; padding: 10px; }
+    .k { color: #a0a0a0; font-size: 12px; margin-bottom: 4px; }
+    .v { font-size: 24px; font-weight: 700; }
+    .line { margin-top: 12px; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; padding: 10px; }
+    .ops { margin-top: 12px; display: grid; gap: 8px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, input { background: #222; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 8px; }
+    a { color: #7ecbff; }
+    .hidden { display: none; }
+    .auth { margin-top: 12px; background: #1b1b1b; border: 1px solid #333; border-radius: 8px; padding: 10px; }
+    .warn { color: #ff9f9f; }
+    .sec { color: #a0a0a0; font-size: 12px; margin: 4px 0 2px; }
+    .field { display: flex; flex-direction: column; min-width: 120px; }
+    .field label { font-size: 12px; color: #a0a0a0; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <h1>ESP32-C6 Status</h1>
+  <div id="authPanel" class="auth">
+    <div id="authMsg">Checking auth...</div>
+    <div id="setupBox" class="hidden">
+      <p>First use: create web password</p>
+      <input id="setupPwd" type="password" placeholder="New password" />
+      <button onclick="setupPassword()">Create Password</button>
+    </div>
+    <div id="loginBox" class="hidden">
+      <p>Login required</p>
+      <input id="loginPwd" type="password" placeholder="Password" />
+      <button onclick="login()">Login</button>
+    </div>
+  </div>
+
+  <div id="mainPanel" class="hidden">
+  <div class="grid">
+    <div class="card"><div class="k">T1</div><div class="v" id="t1">--</div></div>
+    <div class="card"><div class="k">T2</div><div class="v" id="t2">--</div></div>
+    <div class="card"><div class="k">HEAT</div><div class="v" id="heat">--</div></div>
+    <div class="card"><div class="k">SYS</div><div class="v" id="sys">--</div></div>
+  </div>
+  <div class="line" id="limits">--</div>
+  <div class="ops">
+    <div class="sec">Control</div>
+    <div class="row">
+      <button onclick="setSys('toggle')">SYS TOGGLE</button>
+    </div>
+    <div class="row">
+      <input id="targetInput" type="number" step="0.1" min="0" max="300" placeholder="Target °C"/>
+      <button onclick="setTarget()">Set Target</button>
+    </div>
+    <div class="sec">Settings</div>
+    <div class="row">
+      <div class="field"><label for="hysInput">Hys</label><input id="hysInput" type="number" step="0.1" min="0" max="20" placeholder="Hys"/></div>
+      <div class="field"><label for="lowInput">Low</label><input id="lowInput" type="number" step="0.1" min="0" max="200" placeholder="Low"/></div>
+      <div class="field"><label for="highInput">High</label><input id="highInput" type="number" step="0.1" min="0" max="200" placeholder="High"/></div>
+    </div>
+    <div class="row">
+      <div class="field"><label for="t2maxInput">T2Max</label><input id="t2maxInput" type="number" step="0.1" min="0" max="200" placeholder="T2Max"/></div>
+      <div class="field"><label for="t2hyInput">T2Hy</label><input id="t2hyInput" type="number" step="0.1" min="0" max="20" placeholder="T2Hy"/></div>
+      <div class="field"><label for="scrsvInput">ScrSv</label><label><input id="scrsvInput" type="checkbox"/> Enable</label></div>
+      <div class="field"><label for="scrtmInput">ScrTm(s)</label><input id="scrtmInput" type="number" step="10" min="10" max="600" placeholder="ScrTm"/></div>
+      <button onclick="saveSettings()">Save Settings</button>
+    </div>
+    <div class="row">
+      <a href="/logs/download" download>Download Logs</a>
+      <button onclick="logout()">Logout</button>
+      <span id="opResult"></span>
+    </div>
+  </div>
+  </div>
+  <script>
+    let loggedIn = false;
+    let authWasLoggedIn = false;
+
+    function isEditingInputs() {
+      const active = document.activeElement;
+      if (!active) return false;
+      return ['targetInput', 'hysInput', 'lowInput', 'highInput', 't2maxInput', 't2hyInput', 'scrtmInput'].includes(active.id);
+    }
+
+    function bindEnterToApply() {
+      const targetInput = document.getElementById('targetInput');
+      targetInput.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          await setTarget();
+        }
+      });
+
+      ['hysInput', 'lowInput', 'highInput', 't2maxInput', 't2hyInput', 'scrtmInput'].forEach((id) => {
+        const element = document.getElementById(id);
+        element.addEventListener('keydown', async (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            await saveSettings();
+          }
+        });
+      });
+    }
+
+    async function checkAuth() {
+      const res = await fetch('/api/auth/state');
+      const s = await res.json();
+      const authMsg = document.getElementById('authMsg');
+      const setupBox = document.getElementById('setupBox');
+      const loginBox = document.getElementById('loginBox');
+      const mainPanel = document.getElementById('mainPanel');
+
+      setupBox.classList.add('hidden');
+      loginBox.classList.add('hidden');
+      mainPanel.classList.add('hidden');
+
+      if (s.blocked) {
+        authMsg.innerHTML = `<span class="warn">Blocked for ${s.remainingSec}s due to failed logins</span>`;
+        return;
+      }
+
+      if (!s.hasPassword) {
+        authMsg.textContent = 'Create password to continue';
+        setupBox.classList.remove('hidden');
+        return;
+      }
+
+      if (!s.loggedIn) {
+        authMsg.textContent = 'Please login';
+        loginBox.classList.remove('hidden');
+        authWasLoggedIn = false;
+        return;
+      }
+
+      loggedIn = true;
+      authMsg.textContent = 'Authenticated';
+      mainPanel.classList.remove('hidden');
+      if (!authWasLoggedIn) {
+        await refreshStatus();
+        await loadSettings();
+        bindEnterToApply();
+        authWasLoggedIn = true;
+      }
+    }
+
+    async function setupPassword() {
+      const password = document.getElementById('setupPwd').value;
+      const body = new URLSearchParams({ password });
+      const res = await fetch('/api/auth/setup', { method: 'POST', body });
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || '';
+      await checkAuth();
+    }
+
+    async function login() {
+      const password = document.getElementById('loginPwd').value;
+      const body = new URLSearchParams({ password });
+      const res = await fetch('/api/auth/login', { method: 'POST', body });
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || '';
+      await checkAuth();
+    }
+
+    async function logout() {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      loggedIn = false;
+      await checkAuth();
+    }
+
+    async function refreshStatus() {
+      if (!loggedIn) return;
+      try {
+        const res = await fetch('/api/status');
+        if (res.status === 401 || res.status === 403 || res.status === 429) {
+          loggedIn = false;
+          await checkAuth();
+          return;
+        }
+        const s = await res.json();
+        document.getElementById('t1').textContent = `${s.t1.toFixed(1)}°C / ${s.target.toFixed(1)}°C`;
+        document.getElementById('t2').textContent = s.t2Valid ? `${s.t2.toFixed(1)}°C` : 'ERROR';
+        document.getElementById('heat').textContent = s.heaterOn ? 'ON' : 'OFF';
+        document.getElementById('sys').textContent = s.systemEnabled ? 'ON' : 'OFF';
+        document.getElementById('limits').textContent = `Low ${s.safeLow.toFixed(1)}°C | High ${s.safeHigh.toFixed(1)}°C | T2Max ${s.t2Limit.toFixed(1)}°C`;
+        if (!isEditingInputs()) {
+          document.getElementById('targetInput').value = s.target.toFixed(1);
+        }
+      } catch (e) {
+        document.getElementById('limits').textContent = 'Status fetch failed';
+      }
+    }
+
+    async function loadSettings() {
+      if (!loggedIn) return;
+      const res = await fetch('/api/settings');
+      if (!res.ok) return;
+      const s = await res.json();
+      if (isEditingInputs()) return;
+      document.getElementById('targetInput').value = s.target.toFixed(1);
+      document.getElementById('hysInput').value = s.hys.toFixed(1);
+      document.getElementById('lowInput').value = s.low.toFixed(1);
+      document.getElementById('highInput').value = s.high.toFixed(1);
+      document.getElementById('t2maxInput').value = s.t2max.toFixed(1);
+      document.getElementById('t2hyInput').value = s.t2hy.toFixed(1);
+      document.getElementById('scrsvInput').checked = !!s.scrsv;
+      document.getElementById('scrtmInput').value = String(Math.round(s.scrtm));
+    }
+
+    async function setSys(mode) {
+      const res = await fetch(`/api/control?sys=${mode}`);
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || 'OK';
+      refreshStatus();
+    }
+
+    async function setTarget() {
+      const value = document.getElementById('targetInput').value;
+      const res = await fetch(`/api/control?target=${encodeURIComponent(value)}`);
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || 'OK';
+      refreshStatus();
+    }
+
+    async function saveSettings() {
+      const body = new URLSearchParams({
+        hys: document.getElementById('hysInput').value,
+        low: document.getElementById('lowInput').value,
+        high: document.getElementById('highInput').value,
+        t2max: document.getElementById('t2maxInput').value,
+        t2hy: document.getElementById('t2hyInput').value,
+        scrsv: document.getElementById('scrsvInput').checked ? '1' : '0',
+        scrtm: document.getElementById('scrtmInput').value
+      });
+      const res = await fetch('/api/settings/update', { method: 'POST', body });
+      const data = await res.json();
+      document.getElementById('opResult').textContent = data.message || 'OK';
+      await refreshStatus();
+      await loadSettings();
+    }
+
+    checkAuth();
+    setInterval(checkAuth, 3000);
+    setInterval(refreshStatus, 2000);
+  </script>
+</body>
+</html>
+)HTML";
+
+  webServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  webServer.sendHeader("Pragma", "no-cache");
+  webServer.sendHeader("Expires", "0");
+  webServer.send(200, "text/html", html);
+}
+
+void handleWebAuthState() {
+  String ip = getWebClientIp();
+  unsigned long remainingMs = 0;
+  bool blocked = isWebClientBlocked(ip, &remainingMs);
+  bool hasPassword = webPassword.length() > 0;
+  bool loggedIn = hasPassword && isWebClientLoggedIn(ip);
+
+  String json = "{";
+  json += "\"hasPassword\":" + String(hasPassword ? "true" : "false") + ",";
+  json += "\"loggedIn\":" + String(loggedIn ? "true" : "false") + ",";
+  json += "\"blocked\":" + String(blocked ? "true" : "false") + ",";
+  json += "\"remainingSec\":" + String((remainingMs + 999) / 1000);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleWebAuthSetup() {
+  if (webPassword.length() > 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"message\":\"Password already exists\"}");
+    return;
+  }
+
+  if (!webServer.hasArg("password")) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"message\":\"Missing password\"}");
+    return;
+  }
+
+  String password = webServer.arg("password");
+  if (password.length() < 4) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"message\":\"Password too short\"}");
+    return;
+  }
+
+  webPassword = password;
+  saveSettings();
+  markWebLoginSuccess(getWebClientIp());
+  appendLogLine();
+  webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"Password created\"}");
+}
+
+void handleWebAuthLogin() {
+  String ip = getWebClientIp();
+  unsigned long remainingMs = 0;
+  if (isWebClientBlocked(ip, &remainingMs)) {
+    String json = String("{\"ok\":false,\"message\":\"Blocked\",\"remainingSec\":") + String((remainingMs + 999) / 1000) + "}";
+    webServer.send(429, "application/json", json);
+    return;
+  }
+
+  if (webPassword.length() == 0) {
+    webServer.send(403, "application/json", "{\"ok\":false,\"message\":\"Password setup required\"}");
+    return;
+  }
+
+  if (!webServer.hasArg("password")) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"message\":\"Missing password\"}");
+    return;
+  }
+
+  if (webServer.arg("password") == webPassword && webPassword.length() > 0) {
+    markWebLoginSuccess(ip);
+    appendLogLine();
+    webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"Login success\"}");
+  } else {
+    markWebLoginFailure(ip);
+    appendLogLine();
+    webServer.send(401, "application/json", "{\"ok\":false,\"message\":\"Invalid password\"}");
+  }
+}
+
+void handleWebAuthLogout() {
+  markWebLogout(getWebClientIp());
+  webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"Logged out\"}");
+}
+
+void handleWebStatus() {
+  if (!ensureAuthenticated()) return;
+
+  String json = "{";
+  json += "\"t1\":" + String(currentTemp, 2) + ",";
+  json += "\"target\":" + String(targetTemp, 2) + ",";
+  json += "\"t2Valid\":" + String(secondarySensorValid ? "true" : "false") + ",";
+  json += "\"t2\":" + (secondarySensorValid ? String(secondaryTemp, 2) : String("null")) + ",";
+  json += "\"heaterOn\":" + String(heaterOn ? "true" : "false") + ",";
+  json += "\"systemEnabled\":" + String(systemEnabled ? "true" : "false") + ",";
+  json += "\"safeLow\":" + String(safetyLowerTemp, 2) + ",";
+  json += "\"safeHigh\":" + String(safetyUpperTemp, 2) + ",";
+  json += "\"t2Limit\":" + String(secondaryTempLimit, 2);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleWebSettings() {
+  if (!ensureAuthenticated()) return;
+
+  String json = "{";
+  json += "\"target\":" + String(targetTemp, 2) + ",";
+  json += "\"hys\":" + String(tempHysteresis, 2) + ",";
+  json += "\"low\":" + String(safetyLowerTemp, 2) + ",";
+  json += "\"high\":" + String(safetyUpperTemp, 2) + ",";
+  json += "\"t2max\":" + String(secondaryTempLimit, 2) + ",";
+  json += "\"t2hy\":" + String(secondaryTempHysteresis, 2) + ",";
+  json += "\"scrsv\":" + String(screenSaverEnabled ? "true" : "false") + ",";
+  json += "\"scrtm\":" + String(static_cast<unsigned long>(screenSaverTimeoutMs / 1000));
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleWebSettingsUpdate() {
+  if (!ensureAuthenticated()) return;
+
+  if (webServer.hasArg("hys")) tempHysteresis = webServer.arg("hys").toFloat();
+  if (webServer.hasArg("low")) safetyLowerTemp = webServer.arg("low").toFloat();
+  if (webServer.hasArg("high")) safetyUpperTemp = webServer.arg("high").toFloat();
+  if (webServer.hasArg("t2max")) secondaryTempLimit = webServer.arg("t2max").toFloat();
+  if (webServer.hasArg("t2hy")) secondaryTempHysteresis = webServer.arg("t2hy").toFloat();
+  if (webServer.hasArg("scrsv")) screenSaverEnabled = (webServer.arg("scrsv") == "1");
+  if (webServer.hasArg("scrtm")) {
+    long timeoutSec = webServer.arg("scrtm").toInt();
+    screenSaverTimeoutMs = static_cast<uint32_t>(timeoutSec) * 1000UL;
+  }
+  sanitizeRuntimeSettings();
+  saveSettings();
+
+  appendLogLine();
+  webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"Settings updated\"}");
+}
+
+void handleWebControl() {
+  if (!ensureAuthenticated()) return;
+
+  bool changed = false;
+  String message = "No change";
+
+  if (webServer.hasArg("sys")) {
+    String mode = webServer.arg("sys");
+    if (mode == "on") {
+      systemEnabled = true;
+      changed = true;
+      message = "SYS ON";
+    } else if (mode == "off") {
+      systemEnabled = false;
+      changed = true;
+      message = "SYS OFF";
+    } else if (mode == "toggle") {
+      systemEnabled = !systemEnabled;
+      changed = true;
+      message = String("SYS ") + (systemEnabled ? "ON" : "OFF");
+    }
+  }
+
+  if (webServer.hasArg("target")) {
+    float requested = webServer.arg("target").toFloat();
+    targetTemp = requested;
+    sanitizeRuntimeSettings();
+    changed = true;
+    message = String("Target set to ") + String(targetTemp, 1) + "C";
+  }
+
+  if (changed) {
+    saveSettings();
+    appendLogLine();
+  }
+
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"message\":\"" + jsonEscape(message) + "\"";
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleWebLogDownload() {
+  if (!ensureAuthenticated()) return;
+
+  if (!LittleFS.exists(LOG_FILE_PATH)) {
+    webServer.send(200, "text/plain", "No log file yet\n");
+    return;
+  }
+
+  File file = LittleFS.open(LOG_FILE_PATH, "r");
+  if (!file) {
+    webServer.send(500, "text/plain", "Failed to open log file\n");
+    return;
+  }
+
+  webServer.sendHeader("Content-Disposition", "attachment; filename=status.csv");
+  webServer.streamFile(file, "text/plain");
+  file.close();
+}
+
+AuthClientState* getAuthClientState(const String& ip, bool createIfMissing) {
+  int firstEmptyIndex = -1;
+
+  for (int index = 0; index < MAX_AUTH_CLIENTS; index++) {
+    if (authClients[index].ip == ip) {
+      return &authClients[index];
+    }
+    if (firstEmptyIndex < 0 && authClients[index].ip.length() == 0) {
+      firstEmptyIndex = index;
+    }
+  }
+
+  if (!createIfMissing) return nullptr;
+
+  int slot = (firstEmptyIndex >= 0) ? firstEmptyIndex : 0;
+  authClients[slot].ip = ip;
+  authClients[slot].failCount = 0;
+  authClients[slot].blockedUntilMs = 0;
+  authClients[slot].loggedIn = false;
+  return &authClients[slot];
+}
+
+String getWebClientIp() {
+  return webServer.client().remoteIP().toString();
+}
+
+bool isWebClientBlocked(const String& ip, unsigned long* remainingMs) {
+  AuthClientState* client = getAuthClientState(ip, false);
+  if (!client) {
+    if (remainingMs) *remainingMs = 0;
+    return false;
+  }
+
+  unsigned long now = millis();
+  if (client->blockedUntilMs == 0 || now >= client->blockedUntilMs) {
+    client->blockedUntilMs = 0;
+    client->failCount = 0;
+    if (remainingMs) *remainingMs = 0;
+    return false;
+  }
+
+  if (remainingMs) *remainingMs = client->blockedUntilMs - now;
+  return true;
+}
+
+bool isWebClientLoggedIn(const String& ip) {
+  AuthClientState* client = getAuthClientState(ip, false);
+  return client && client->loggedIn;
+}
+
+void markWebLoginFailure(const String& ip) {
+  AuthClientState* client = getAuthClientState(ip, true);
+  if (!client) return;
+
+  client->loggedIn = false;
+  if (client->failCount < 255) client->failCount++;
+  if (client->failCount >= WEB_AUTH_MAX_FAILS) {
+    client->blockedUntilMs = millis() + WEB_AUTH_BLOCK_MS;
+    client->failCount = 0;
+  }
+}
+
+void markWebLoginSuccess(const String& ip) {
+  AuthClientState* client = getAuthClientState(ip, true);
+  if (!client) return;
+
+  client->loggedIn = true;
+  client->failCount = 0;
+  client->blockedUntilMs = 0;
+}
+
+void markWebLogout(const String& ip) {
+  AuthClientState* client = getAuthClientState(ip, false);
+  if (!client) return;
+  client->loggedIn = false;
+}
+
+bool ensureAuthenticated() {
+  String ip = getWebClientIp();
+  unsigned long remainingMs = 0;
+
+  if (isWebClientBlocked(ip, &remainingMs)) {
+    String json = String("{\"ok\":false,\"message\":\"Blocked\",\"remainingSec\":") + String((remainingMs + 999) / 1000) + "}";
+    webServer.send(429, "application/json", json);
+    return false;
+  }
+
+  if (webPassword.length() == 0) {
+    webServer.send(403, "application/json", "{\"ok\":false,\"message\":\"Password setup required\"}");
+    return false;
+  }
+
+  if (!isWebClientLoggedIn(ip)) {
+    webServer.send(401, "application/json", "{\"ok\":false,\"message\":\"Authentication required\"}");
+    return false;
+  }
+
+  return true;
+}
+
+String jsonEscape(const String& input) {
+  String output = input;
+  output.replace("\\", "\\\\");
+  output.replace("\"", "\\\"");
+  return output;
+}
+
+void rotateLogsIfNeeded() {
+  if (!LittleFS.exists(LOG_FILE_PATH)) return;
+
+  File logFile = LittleFS.open(LOG_FILE_PATH, "r");
+  if (!logFile) return;
+  size_t fileSize = logFile.size();
+  logFile.close();
+
+  if (fileSize <= LOG_MAX_FILE_SIZE) return;
+
+  if (LittleFS.exists(LOG_OLD_FILE_PATH)) {
+    LittleFS.remove(LOG_OLD_FILE_PATH);
+  }
+  LittleFS.rename(LOG_FILE_PATH, LOG_OLD_FILE_PATH);
+}
+
+String formatLogTimestamp() {
+  time_t now = time(nullptr);
+  struct tm tmNow;
+
+  if (now > 100000 && localtime_r(&now, &tmNow)) {
+    char buffer[15];
+    snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d%02d",
+             tmNow.tm_year + 1900,
+             tmNow.tm_mon + 1,
+             tmNow.tm_mday,
+             tmNow.tm_hour,
+             tmNow.tm_min,
+             tmNow.tm_sec);
+    return String(buffer);
+  }
+
+  unsigned long seconds = millis() / 1000;
+  unsigned long hh = (seconds / 3600) % 24;
+  unsigned long mm = (seconds / 60) % 60;
+  unsigned long ss = seconds % 60;
+  char fallback[15];
+  snprintf(fallback, sizeof(fallback), "19700101%02lu%02lu%02lu", hh, mm, ss);
+  return String(fallback);
+}
+
+void appendLogLine() {
+  File logFile = LittleFS.open(LOG_FILE_PATH, "a");
+  if (!logFile) return;
+
+  String timestamp = formatLogTimestamp();
+  int t1Int = (int)lroundf(currentTemp);
+  int t1SetInt = (int)lroundf(targetTemp);
+  String t2Field = secondarySensorValid ? String((int)lroundf(secondaryTemp)) : String("");
+  char heatState = heaterOn ? 'O' : 'F';
+  logFile.printf("%s,%d,%d,%s,%c\n", timestamp.c_str(), t1Int, t1SetInt, t2Field.c_str(), heatState);
+  logFile.close();
+  rotateLogsIfNeeded();
+}
+
+void appendPeriodicStatusLog() {
+  unsigned long now = millis();
+  if (now - lastWebLogWriteMs < WEB_LOG_INTERVAL_MS) return;
+  lastWebLogWriteMs = now;
+
+  appendLogLine();
+}
+
+void migrateLegacyLogFormatIfNeeded() {
+  if (!LittleFS.exists(LOG_FILE_PATH)) return;
+
+  File logFile = LittleFS.open(LOG_FILE_PATH, "r");
+  if (!logFile) return;
+
+  String firstLine = logFile.readStringUntil('\n');
+  logFile.close();
+  firstLine.trim();
+  if (firstLine.length() == 0) return;
+
+  int commaCount = 0;
+  for (size_t i = 0; i < firstLine.length(); i++) {
+    if (firstLine[i] == ',') commaCount++;
+  }
+
+  bool timestampOk = firstLine.length() >= 14;
+  for (int i = 0; i < 14 && i < (int)firstLine.length(); i++) {
+    if (firstLine[i] < '0' || firstLine[i] > '9') {
+      timestampOk = false;
+      break;
+    }
+  }
+
+  bool formatOk = (commaCount == 4) && timestampOk;
+  if (formatOk) return;
+
+  if (LittleFS.exists(LOG_OLD_FILE_PATH)) {
+    LittleFS.remove(LOG_OLD_FILE_PATH);
+  }
+  LittleFS.rename(LOG_FILE_PATH, LOG_OLD_FILE_PATH);
 }
 
 void updateDisplay() {
@@ -823,6 +1577,7 @@ void updateDisplay() {
       display.printf("%s T2Mx: %.0f\xF8" "C\n", settingsSelection == 3 ? ">" : " ", secondaryTempLimit);
       display.printf("%s T2Hy: %.1f\xF8" "C\n", settingsSelection == 4 ? ">" : " ", secondaryTempHysteresis);
       display.printf("%s ScrSv: %s\n", settingsSelection == 5 ? ">" : " ", screenSaverEnabled ? "ON" : "OFF");
+      display.printf("%s ScrTm: %lus\n", settingsSelection == 6 ? ">" : " ", static_cast<unsigned long>(screenSaverTimeoutMs / 1000));
       display.println();
       display.println(settingsEditing ? F("Mode: EDIT") : F("Mode: SELECT"));
       display.println(settingsEditing ? F("Rotate: adjust") : F("Rotate: choose"));
@@ -890,19 +1645,21 @@ void drawMainMenu() {
 }
 
 void drawPopupMenu() {
+  String wifiState = (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
+  String ipText = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "-";
+
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println(F("=== MENU ==="));
-  display.println();
   display.println(menuSelection == 0 ? "> Set Target" : "  Set Target");
   display.println(menuSelection == 1
                     ? (systemEnabled ? "> SYS: ON" : "> SYS: OFF")
                     : (systemEnabled ? "  SYS: ON" : "  SYS: OFF"));
   display.println(menuSelection == 2 ? "> Settings" : "  Settings");
   display.println(menuSelection == 3 ? "> Factory Reset" : "  Factory Reset");
-  display.println();
-  display.println(F("SW: Select/Toggle"));
-  display.println(F("BACK: Close"));
+  display.println(String("WiFi: ") + wifiState);
+  display.println(String("IP: ") + ipText);
+  display.println(F("SW:SEL BACK:EXIT"));
 }
 
 void drawConfirmActionMenu() {

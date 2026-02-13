@@ -66,24 +66,40 @@
 #define OLED_RESET      -1
 #define SCREEN_ADDRESS  0x3C  // Some displays use 0x3D
 #define SCREEN_SAVER_ENABLED true
-#define SCREEN_SAVER_TIMEOUT_MS 60000  // Auto turn off display after inactivity (ms)
+#define DEFAULT_SCREEN_SAVER_TIMEOUT_MS 60000   // Default auto turn off display timeout (ms)
+#define MIN_SCREEN_SAVER_TIMEOUT_MS     10000   // Minimum timeout (ms)
+#define MAX_SCREEN_SAVER_TIMEOUT_MS    600000   // Maximum timeout (ms)
+#define SCREEN_SAVER_TIMEOUT_STEP_MS    10000   // Timeout adjust step (ms)
+
+// ========================
+// Network / Web Dashboard
+// ========================
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+#define WEB_DASHBOARD_PORT 80
+#define WEB_STATUS_REFRESH_MS 2000
+#define WEB_LOG_INTERVAL_MS 10000
+#define LOG_MAX_FILE_SIZE 65536
+#define WEB_AUTH_MAX_FAILS 5
+#define WEB_AUTH_BLOCK_MS 300000
 
 // ========================
 // Temperature Control
 // ========================
-#define DEFAULT_TARGET_TEMP  18.0   // Default target (°C)
+#define DEFAULT_TARGET_TEMP  80.0   // Default target (°C)
 #define TEMP_HYSTERESIS      2.0    // Control hysteresis (±°C)
 #define MIN_HYSTERESIS       0.1    // Minimum hysteresis (°C)
 #define MAX_HYSTERESIS       20.0   // Maximum hysteresis (°C)
 #define HYSTERESIS_ADJUST_STEP 0.1  // Hysteresis adjust step
-#define DEFAULT_SAFE_LOWER_TEMP  0.0    // Default lower safety boundary (°C)
+#define DEFAULT_SAFE_LOWER_TEMP  5    // Default lower safety boundary (°C)
 #define DEFAULT_SAFE_UPPER_TEMP  MAX_SAFE_TEMP // Default upper safety boundary (°C)
 #define SAFETY_BOUNDARY_MIN     5.0   // Hard minimum boundary value
-#define SAFETY_BOUNDARY_MAX     95.0   // Hard maximum boundary value
+#define SAFETY_BOUNDARY_MAX     85.0   // Hard maximum boundary value
 #define SAFETY_BOUNDARY_STEP      1.0   // Safety boundary adjust step (°C)
 #define MIN_SAFE_RANGE_GAP        5.0   // Minimum gap between lower and upper boundary (°C)
 #define MIN_TEMP                 5// Minimum settable temp
-#define MAX_TEMP             95.0  // Maximum settable temp
+#define MAX_TEMP             85.0  // Maximum settable temp
 #define TEMP_ADJUST_STEP     0.5    // Adjustment step per encoder click
 
 // Second temperature sensor (MAX31865 + PT100)
