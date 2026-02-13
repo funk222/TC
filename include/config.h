@@ -89,6 +89,7 @@
 // ========================
 #define DEFAULT_TARGET_TEMP  80.0   // Default target (°C)
 #define TEMP_HYSTERESIS      2.0    // Control hysteresis (±°C)
+#define T1_SMOOTHING_ALPHA   0.25f  // T1 EMA平滑系数(0~1): 越大响应越快, 越小越平滑
 #define MIN_HYSTERESIS       0.1    // Minimum hysteresis (°C)
 #define MAX_HYSTERESIS       20.0   // Maximum hysteresis (°C)
 #define HYSTERESIS_ADJUST_STEP 0.1  // Hysteresis adjust step

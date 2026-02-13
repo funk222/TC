@@ -44,6 +44,7 @@ Preferences settingsStore;
 WebServer webServer(WEB_DASHBOARD_PORT);
 const char* LOG_FILE_PATH = "/status.csv";
 const char* LOG_OLD_FILE_PATH = "/status.old.csv";
+const char* LOG_CSV_HEADER = "date,time,T1,T1set,T2,Heat";
 
 const char* SETTINGS_NAMESPACE = "tempctrl";
 const char* KEY_TARGET_TEMP = "target";
@@ -70,6 +71,7 @@ AuthClientState authClients[MAX_AUTH_CLIENTS];
 
 // 温度控制变量
 float currentTemp = 0.0;
+float currentTempRaw = 0.0;
 float secondaryTemp = 0.0;
 float targetTemp = DEFAULT_TARGET_TEMP;
 float tempHysteresis = TEMP_HYSTERESIS;
@@ -84,6 +86,7 @@ bool safetyTripActive = false;
 uint8_t pt100FaultCount = 0;
 unsigned long lastPt100ValidMs = 0;
 float lastPt100Temp = NAN;
+bool t1FilterInitialized = false;
 
 // 菜单系统
 enum MenuState {
@@ -118,9 +121,9 @@ const int MAIN_TOTAL_LINES = 4;
 
 // 编码器变量
 volatile int encoderPos = 0;
-volatile int lastEncoded = 0;
-unsigned long lastEncoderTime = 0;
-const unsigned long debounceDelay = ENCODER_DEBOUNCE_DELAY;
+volatile uint8_t lastEncoded = 0;
+volatile int8_t encoderTransitionAcc = 0;
+volatile unsigned long lastEncoderTimeUs = 0;
 
 // 按键防抖
 unsigned long lastBtnConfirmTime = 0;
@@ -190,7 +193,7 @@ void markWebLogout(const String& ip);
 bool ensureAuthenticated();
 String jsonEscape(const String& input);
 void rotateLogsIfNeeded();
-String formatLogTimestamp();
+void formatLogDateAndTime(String& datePart, String& timePart);
 void appendLogLine();
 void appendPeriodicStatusLog();
 void migrateLegacyLogFormatIfNeeded();
@@ -258,6 +261,9 @@ void setup() {
   pinMode(BTN_BACK, INPUT_PULLUP);    // 返回键
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+
+  lastEncoded = (static_cast<uint8_t>(digitalRead(ENCODER_CLK)) << 1)
+              | static_cast<uint8_t>(digitalRead(ENCODER_DT));
 
   // 初始化RGB LED
   rgbLED.begin();
@@ -353,22 +359,33 @@ void loop() {
 
 // 编码器中断服务程序
 void IRAM_ATTR encoderISR() {
-  unsigned long currentTime = millis();
-  if (currentTime - lastEncoderTime < debounceDelay) return;
-  lastEncoderTime = currentTime;
+  static const int8_t transitionTable[16] = {
+    0, -1, 1, 0,
+    1, 0, 0, -1,
+    -1, 0, 0, 1,
+    0, 1, -1, 0
+  };
 
-  int MSB = digitalRead(ENCODER_CLK);
-  int LSB = digitalRead(ENCODER_DT);
+  unsigned long nowUs = micros();
+  if (nowUs - lastEncoderTimeUs < 300) return;
+  lastEncoderTimeUs = nowUs;
 
-  int encoded = (MSB << 1) | LSB;
-  int sum = (lastEncoded << 2) | encoded;
+  uint8_t msb = static_cast<uint8_t>(digitalRead(ENCODER_CLK));
+  uint8_t lsb = static_cast<uint8_t>(digitalRead(ENCODER_DT));
+  uint8_t encoded = (msb << 1) | lsb;
+  uint8_t transition = (lastEncoded << 2) | encoded;
+  int8_t movement = transitionTable[transition & 0x0F];
 
-  // 使用格雷码解码旋转方向
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-    encoderPos++;
-  }
-  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-    encoderPos--;
+  if (movement != 0) {
+    int8_t nextAcc = static_cast<int8_t>(encoderTransitionAcc + movement);
+    if (nextAcc >= 4) {
+      encoderPos = encoderPos + 1;
+      nextAcc = 0;
+    } else if (nextAcc <= -4) {
+      encoderPos = encoderPos - 1;
+      nextAcc = 0;
+    }
+    encoderTransitionAcc = nextAcc;
   }
 
   lastEncoded = encoded;
@@ -559,7 +576,7 @@ void handleMenuNavigation() {
 
       case MENU_POPUP:
         // 弹出菜单导航
-        menuSelection += delta;
+        menuSelection += (delta > 0) ? 1 : -1;
         if (menuSelection < 0) menuSelection = 3;
         if (menuSelection > 3) menuSelection = 0;
         break;
@@ -630,7 +647,7 @@ void handleMenuNavigation() {
           }
         } else {
           // 未编辑时，旋钮切换设置项
-          settingsSelection += delta;
+          settingsSelection += (delta > 0) ? 1 : -1;
           if (settingsSelection < 0) settingsSelection = 6;
           if (settingsSelection > 6) settingsSelection = 0;
         }
@@ -641,7 +658,32 @@ void handleMenuNavigation() {
 
 void readTemperature() {
   unsigned long now = millis();
-  currentTemp = thermocouple.readCelsius();
+  float measuredT1 = thermocouple.readCelsius();
+
+  if (isnan(measuredT1)) {
+    #if ENABLE_SERIAL_DEBUG
+    Serial.println("错误：热电偶读取失败！");
+    #endif
+    if (t1FilterInitialized) {
+      measuredT1 = currentTemp;
+    } else {
+      measuredT1 = 0.0f;
+    }
+  }
+
+  currentTempRaw = measuredT1;
+
+  float smoothingAlpha = T1_SMOOTHING_ALPHA;
+  if (smoothingAlpha < 0.0f) smoothingAlpha = 0.0f;
+  if (smoothingAlpha > 1.0f) smoothingAlpha = 1.0f;
+
+  if (!t1FilterInitialized) {
+    currentTemp = measuredT1;
+    t1FilterInitialized = true;
+  } else {
+    currentTemp = (smoothingAlpha * measuredT1) + ((1.0f - smoothingAlpha) * currentTemp);
+  }
+
   uint8_t pt100Fault = pt100Sensor.readFault();
   bool newPt100Valid = false;
 
@@ -679,29 +721,22 @@ void readTemperature() {
     }
   }
   
-  if (isnan(currentTemp)) {
-    #if ENABLE_SERIAL_DEBUG
-    Serial.println("错误：热电偶读取失败！");
-    #endif
-    currentTemp = 0.0;
-  }
-  
   #if ENABLE_OVERHEAT_PROTECTION
   // 安全边界保护
-  if (currentTemp > safetyUpperTemp || currentTemp < safetyLowerTemp) {
+  if (currentTempRaw > safetyUpperTemp || currentTempRaw < safetyLowerTemp) {
     digitalWrite(RELAY_PIN, LOW);
     heaterOn = false;
     systemEnabled = false;
     safetyTripActive = true;
     #if ENABLE_SERIAL_DEBUG
-    Serial.printf("!!! 安全保护激活 !!! 当前温度 %.2f°C 超出范围 [%.1f, %.1f]\n", currentTemp, safetyLowerTemp, safetyUpperTemp);
+    Serial.printf("!!! 安全保护激活 !!! 当前温度 %.2f°C 超出范围 [%.1f, %.1f]\n", currentTempRaw, safetyLowerTemp, safetyUpperTemp);
     #endif
   } else if (safetyTripActive) {
     // 仅对“安全保护触发导致的关机”自动恢复
     safetyTripActive = false;
     systemEnabled = true;
     #if ENABLE_SERIAL_DEBUG
-    Serial.printf("*** 温度恢复安全区间，系统自动恢复开启 (%.2f°C 在 [%.1f, %.1f])\n", currentTemp, safetyLowerTemp, safetyUpperTemp);
+    Serial.printf("*** 温度恢复安全区间，系统自动恢复开启 (%.2f°C 在 [%.1f, %.1f])\n", currentTempRaw, safetyLowerTemp, safetyUpperTemp);
     #endif
   }
   #endif
@@ -1493,41 +1528,52 @@ void rotateLogsIfNeeded() {
   LittleFS.rename(LOG_FILE_PATH, LOG_OLD_FILE_PATH);
 }
 
-String formatLogTimestamp() {
+void formatLogDateAndTime(String& datePart, String& timePart) {
   time_t now = time(nullptr);
   struct tm tmNow;
 
   if (now > 100000 && localtime_r(&now, &tmNow)) {
-    char buffer[15];
-    snprintf(buffer, sizeof(buffer), "%04d%02d%02d%02d%02d%02d",
+    char dateBuffer[11];
+    char timeBuffer[9];
+    snprintf(dateBuffer, sizeof(dateBuffer), "%04d/%02d/%02d",
              tmNow.tm_year + 1900,
              tmNow.tm_mon + 1,
-             tmNow.tm_mday,
+             tmNow.tm_mday);
+    snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d",
              tmNow.tm_hour,
              tmNow.tm_min,
              tmNow.tm_sec);
-    return String(buffer);
+    datePart = String(dateBuffer);
+    timePart = String(timeBuffer);
+    return;
   }
 
   unsigned long seconds = millis() / 1000;
   unsigned long hh = (seconds / 3600) % 24;
   unsigned long mm = (seconds / 60) % 60;
   unsigned long ss = seconds % 60;
-  char fallback[15];
-  snprintf(fallback, sizeof(fallback), "19700101%02lu%02lu%02lu", hh, mm, ss);
-  return String(fallback);
+  char fallbackTime[9];
+  snprintf(fallbackTime, sizeof(fallbackTime), "%02lu:%02lu:%02lu", hh, mm, ss);
+  datePart = "1970/01/01";
+  timePart = String(fallbackTime);
 }
 
 void appendLogLine() {
   File logFile = LittleFS.open(LOG_FILE_PATH, "a");
   if (!logFile) return;
 
-  String timestamp = formatLogTimestamp();
+  if (logFile.size() == 0) {
+    logFile.println(LOG_CSV_HEADER);
+  }
+
+  String datePart;
+  String timePart;
+  formatLogDateAndTime(datePart, timePart);
   int t1Int = (int)lroundf(currentTemp);
   int t1SetInt = (int)lroundf(targetTemp);
   String t2Field = secondarySensorValid ? String((int)lroundf(secondaryTemp)) : String("");
   char heatState = heaterOn ? 'O' : 'F';
-  logFile.printf("%s,%d,%d,%s,%c\n", timestamp.c_str(), t1Int, t1SetInt, t2Field.c_str(), heatState);
+  logFile.printf("%s,%s,%d,%d,%s,%c\n", datePart.c_str(), timePart.c_str(), t1Int, t1SetInt, t2Field.c_str(), heatState);
   logFile.close();
   rotateLogsIfNeeded();
 }
@@ -1547,6 +1593,12 @@ void migrateLegacyLogFormatIfNeeded() {
   if (!logFile) return;
 
   String firstLine = logFile.readStringUntil('\n');
+  firstLine.trim();
+
+  if (firstLine == LOG_CSV_HEADER) {
+    firstLine = logFile.readStringUntil('\n');
+  }
+
   logFile.close();
   firstLine.trim();
   if (firstLine.length() == 0) return;
@@ -1556,15 +1608,39 @@ void migrateLegacyLogFormatIfNeeded() {
     if (firstLine[i] == ',') commaCount++;
   }
 
-  bool timestampOk = firstLine.length() >= 14;
-  for (int i = 0; i < 14 && i < (int)firstLine.length(); i++) {
-    if (firstLine[i] < '0' || firstLine[i] > '9') {
-      timestampOk = false;
-      break;
+  int firstComma = firstLine.indexOf(',');
+  int secondComma = (firstComma >= 0) ? firstLine.indexOf(',', firstComma + 1) : -1;
+  bool dateOk = false;
+  bool timeOk = false;
+
+  if (firstComma > 0 && secondComma > firstComma + 1) {
+    String dateField = firstLine.substring(0, firstComma);
+    String timeField = firstLine.substring(firstComma + 1, secondComma);
+
+    dateOk = dateField.length() == 10 && dateField[4] == '/' && dateField[7] == '/';
+    if (dateOk) {
+      for (int i = 0; i < 10; i++) {
+        if (i == 4 || i == 7) continue;
+        if (dateField[i] < '0' || dateField[i] > '9') {
+          dateOk = false;
+          break;
+        }
+      }
+    }
+
+    timeOk = timeField.length() == 8 && timeField[2] == ':' && timeField[5] == ':';
+    if (timeOk) {
+      for (int i = 0; i < 8; i++) {
+        if (i == 2 || i == 5) continue;
+        if (timeField[i] < '0' || timeField[i] > '9') {
+          timeOk = false;
+          break;
+        }
+      }
     }
   }
 
-  bool formatOk = (commaCount == 4) && timestampOk;
+  bool formatOk = (commaCount == 5) && dateOk && timeOk;
   if (formatOk) return;
 
   if (LittleFS.exists(LOG_OLD_FILE_PATH)) {
