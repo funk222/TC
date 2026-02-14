@@ -73,6 +73,7 @@ AuthClientState authClients[MAX_AUTH_CLIENTS];
 float currentTemp = 0.0;
 float currentTempRaw = 0.0;
 float secondaryTemp = 0.0;
+float secondaryTempRaw = 0.0;
 float targetTemp = DEFAULT_TARGET_TEMP;
 float tempHysteresis = TEMP_HYSTERESIS;
 float safetyLowerTemp = DEFAULT_SAFE_LOWER_TEMP;
@@ -87,6 +88,7 @@ uint8_t pt100FaultCount = 0;
 unsigned long lastPt100ValidMs = 0;
 float lastPt100Temp = NAN;
 bool t1FilterInitialized = false;
+bool t2FilterInitialized = false;
 
 // 菜单系统
 enum MenuState {
@@ -713,7 +715,19 @@ void readTemperature() {
 
   float measuredT2 = thermocouple.readCelsius();
   if (!isnan(measuredT2)) {
-    secondaryTemp = measuredT2;
+    secondaryTempRaw = measuredT2;
+
+    float secondarySmoothingAlpha = T2_SMOOTHING_ALPHA;
+    if (secondarySmoothingAlpha < 0.0f) secondarySmoothingAlpha = 0.0f;
+    if (secondarySmoothingAlpha > 1.0f) secondarySmoothingAlpha = 1.0f;
+
+    if (!t2FilterInitialized) {
+      secondaryTemp = secondaryTempRaw;
+      t2FilterInitialized = true;
+    } else {
+      secondaryTemp = (secondarySmoothingAlpha * secondaryTempRaw) + ((1.0f - secondarySmoothingAlpha) * secondaryTemp);
+    }
+
     secondarySensorValid = true;
   } else {
     secondarySensorValid = false;
@@ -768,7 +782,7 @@ void controlHeater() {
   // 第二传感器联锁：
   // - T2 有效且 >= 上限：强制关闭 SSR
   // - T2 有效且 < 上限，或 T2 无效：允许 T1 控制
-  if (secondarySensorValid && secondaryTemp >= secondaryTempLimit) {
+  if (secondarySensorValid && secondaryTempRaw >= secondaryTempLimit) {
     digitalWrite(RELAY_PIN, LOW);
     heaterOn = false;
     return;
