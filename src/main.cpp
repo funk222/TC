@@ -141,6 +141,9 @@ const unsigned long ledUpdateInterval = 100;  // LED更新间隔
 unsigned long alarmBlinkTimer = 0;
 bool alarmLEDState = false;
 uint8_t alarmSequenceStep = 0;
+const uint32_t screenSaverTimeoutMinMinutes = MIN_SCREEN_SAVER_TIMEOUT_MS / 60000UL;
+const uint32_t screenSaverTimeoutMaxMinutes = MAX_SCREEN_SAVER_TIMEOUT_MS / 60000UL;
+const uint32_t screenSaverTimeoutStepMinutes = SCREEN_SAVER_TIMEOUT_STEP_MS / 60000UL;
 
 enum AlarmMode {
   ALARM_NONE,
@@ -631,7 +634,7 @@ void handleMenuNavigation() {
             // 屏幕保护开关
             if (delta != 0) screenSaverEnabled = !screenSaverEnabled;
           } else if (settingsSelection == 6) {
-            // 屏幕保护时长（毫秒）
+            // 屏幕保护时长（分钟步进，内部毫秒）
             int32_t nextValue = static_cast<int32_t>(screenSaverTimeoutMs) + (delta * SCREEN_SAVER_TIMEOUT_STEP_MS);
             if (nextValue < MIN_SCREEN_SAVER_TIMEOUT_MS) nextValue = MIN_SCREEN_SAVER_TIMEOUT_MS;
             if (nextValue > MAX_SCREEN_SAVER_TIMEOUT_MS) nextValue = MAX_SCREEN_SAVER_TIMEOUT_MS;
@@ -658,46 +661,19 @@ void handleMenuNavigation() {
 
 void readTemperature() {
   unsigned long now = millis();
-  float measuredT1 = thermocouple.readCelsius();
-
-  if (isnan(measuredT1)) {
-    #if ENABLE_SERIAL_DEBUG
-    Serial.println("错误：热电偶读取失败！");
-    #endif
-    if (t1FilterInitialized) {
-      measuredT1 = currentTemp;
-    } else {
-      measuredT1 = 0.0f;
-    }
-  }
-
-  currentTempRaw = measuredT1;
-
-  float smoothingAlpha = T1_SMOOTHING_ALPHA;
-  if (smoothingAlpha < 0.0f) smoothingAlpha = 0.0f;
-  if (smoothingAlpha > 1.0f) smoothingAlpha = 1.0f;
-
-  if (!t1FilterInitialized) {
-    currentTemp = measuredT1;
-    t1FilterInitialized = true;
-  } else {
-    currentTemp = (smoothingAlpha * measuredT1) + ((1.0f - smoothingAlpha) * currentTemp);
-  }
-
+  bool newPrimaryValid = false;
   uint8_t pt100Fault = pt100Sensor.readFault();
-  bool newPt100Valid = false;
 
   if (pt100Fault == 0) {
-    float measuredPt100 = pt100Sensor.temperature(PT100_RNOMINAL, PT100_RREF);
-    if (!isnan(measuredPt100)) {
-      if (isnan(lastPt100Temp) || fabsf(measuredPt100 - lastPt100Temp) <= PT100_MAX_JUMP_PER_SAMPLE) {
-        secondaryTemp = measuredPt100;
-        lastPt100Temp = measuredPt100;
+    float measuredT1 = pt100Sensor.temperature(PT100_RNOMINAL, PT100_RREF);
+    if (!isnan(measuredT1)) {
+      if (isnan(lastPt100Temp) || fabsf(measuredT1 - lastPt100Temp) <= PT100_MAX_JUMP_PER_SAMPLE) {
+        currentTempRaw = measuredT1;
+        lastPt100Temp = measuredT1;
         lastPt100ValidMs = now;
         pt100FaultCount = 0;
-        newPt100Valid = true;
+        newPrimaryValid = true;
       } else {
-        // 单次突变过大，视为瞬时干扰
         pt100FaultCount++;
       }
     } else {
@@ -708,21 +684,46 @@ void readTemperature() {
     pt100Sensor.clearFault();
   }
 
-  if (newPt100Valid) {
-    secondarySensorValid = true;
-  } else {
+  if (!newPrimaryValid) {
     unsigned long validAge = now - lastPt100ValidMs;
     if (!isnan(lastPt100Temp) && validAge <= PT100_VALID_HOLD_MS && pt100FaultCount < PT100_FAULT_DEBOUNCE_COUNT) {
-      // 接触抖动期间短时保留最后有效值
-      secondaryTemp = lastPt100Temp;
-      secondarySensorValid = true;
+      currentTempRaw = lastPt100Temp;
     } else {
-      secondarySensorValid = false;
+      #if ENABLE_SERIAL_DEBUG
+      Serial.println("错误：PT100(T1) 读取失败！");
+      #endif
+      if (t1FilterInitialized) {
+        currentTempRaw = currentTemp;
+      } else {
+        currentTempRaw = 0.0f;
+      }
     }
   }
-  
+
+  float smoothingAlpha = T1_SMOOTHING_ALPHA;
+  if (smoothingAlpha < 0.0f) smoothingAlpha = 0.0f;
+  if (smoothingAlpha > 1.0f) smoothingAlpha = 1.0f;
+
+  if (!t1FilterInitialized) {
+    currentTemp = currentTempRaw;
+    t1FilterInitialized = true;
+  } else {
+    currentTemp = (smoothingAlpha * currentTempRaw) + ((1.0f - smoothingAlpha) * currentTemp);
+  }
+
+  float measuredT2 = thermocouple.readCelsius();
+  if (!isnan(measuredT2)) {
+    secondaryTemp = measuredT2;
+    secondarySensorValid = true;
+  } else {
+    secondarySensorValid = false;
+    #if ENABLE_SERIAL_DEBUG
+    Serial.println("警告：MAX6675(T2) 读取失败，联锁暂不可用");
+    #endif
+  }
+
   #if ENABLE_OVERHEAT_PROTECTION
-  // 安全边界保护
+  // 安全边界保护（基于 T1 原始值）
   if (currentTempRaw > safetyUpperTemp || currentTempRaw < safetyLowerTemp) {
     digitalWrite(RELAY_PIN, LOW);
     heaterOn = false;
@@ -740,7 +741,7 @@ void readTemperature() {
     #endif
   }
   #endif
-  
+
   #if ENABLE_SERIAL_DEBUG
   if (currentTemp > 0) {
     if (secondarySensorValid) {
@@ -751,8 +752,8 @@ void readTemperature() {
                     heaterOn ? "ON " : "OFF", 
                     systemEnabled ? "ON " : "OFF");
     } else {
-      Serial.printf("T1: %.2f°C | T2: ERROR(fc=%u) | T2Lim: %.1f°C | 目标: %.1f°C | Hys: %.1f | Safe:[%.1f,%.1f] | 加热: %s | 系统: %s\n", 
-                  currentTemp, pt100FaultCount,
+      Serial.printf("T1: %.2f°C | T2: ERROR | T2Lim: %.1f°C | 目标: %.1f°C | Hys: %.1f | Safe:[%.1f,%.1f] | 加热: %s | 系统: %s\n", 
+                  currentTemp,
                   secondaryTempLimit,
                   targetTemp, 
                   tempHysteresis, safetyLowerTemp, safetyUpperTemp,
@@ -837,7 +838,7 @@ void loadSettings() {
   sanitizeRuntimeSettings();
 
   #if ENABLE_SERIAL_DEBUG
-  Serial.printf("已加载设置: T=%.1f Hys=%.1f Low=%.1f High=%.1f T2Lim=%.1f T2Hys=%.1f ScrSav=%s ScrTm=%lus Sys=%s\n",
+  Serial.printf("已加载设置: T=%.1f Hys=%.1f Low=%.1f High=%.1f T2Lim=%.1f T2Hys=%.1f ScrSav=%s ScrTm=%lumin Sys=%s\n",
                 targetTemp,
                 tempHysteresis,
                 safetyLowerTemp,
@@ -845,7 +846,7 @@ void loadSettings() {
                 secondaryTempLimit,
                 secondaryTempHysteresis,
                 screenSaverEnabled ? "ON" : "OFF",
-                static_cast<unsigned long>(screenSaverTimeoutMs / 1000),
+                static_cast<unsigned long>(screenSaverTimeoutMs / 60000),
                 systemEnabled ? "ON" : "OFF");
   #endif
 }
@@ -1002,7 +1003,7 @@ void handleWebRoot() {
       <div class="field"><label for="t2maxInput">T2Max</label><input id="t2maxInput" type="number" step="0.1" min="0" max="200" placeholder="T2Max"/></div>
       <div class="field"><label for="t2hyInput">T2Hy</label><input id="t2hyInput" type="number" step="0.1" min="0" max="20" placeholder="T2Hy"/></div>
       <div class="field"><label for="scrsvInput">ScrSv</label><label><input id="scrsvInput" type="checkbox"/> Enable</label></div>
-      <div class="field"><label for="scrtmInput">ScrTm(s)</label><input id="scrtmInput" type="number" step="10" min="10" max="600" placeholder="ScrTm"/></div>
+      <div class="field"><label for="scrtmInput">ScrTm(min)</label><input id="scrtmInput" type="number" step="1" min="1" max="100" placeholder="ScrTm"/></div>
       <button onclick="saveSettings()">Save Settings</button>
     </div>
     <div class="row">
@@ -1137,6 +1138,10 @@ void handleWebRoot() {
       if (!res.ok) return;
       const s = await res.json();
       if (isEditingInputs()) return;
+      const scrtmInput = document.getElementById('scrtmInput');
+      if (Number.isFinite(s.scrtmMin)) scrtmInput.min = String(Math.round(s.scrtmMin));
+      if (Number.isFinite(s.scrtmMax)) scrtmInput.max = String(Math.round(s.scrtmMax));
+      if (Number.isFinite(s.scrtmStep)) scrtmInput.step = String(Math.round(s.scrtmStep));
       document.getElementById('targetInput').value = s.target.toFixed(1);
       document.getElementById('hysInput').value = s.hys.toFixed(1);
       document.getElementById('lowInput').value = s.low.toFixed(1);
@@ -1144,7 +1149,7 @@ void handleWebRoot() {
       document.getElementById('t2maxInput').value = s.t2max.toFixed(1);
       document.getElementById('t2hyInput').value = s.t2hy.toFixed(1);
       document.getElementById('scrsvInput').checked = !!s.scrsv;
-      document.getElementById('scrtmInput').value = String(Math.round(s.scrtm));
+      scrtmInput.value = String(Math.round(s.scrtm));
     }
 
     async function setSys(mode) {
@@ -1304,7 +1309,10 @@ void handleWebSettings() {
   json += "\"t2max\":" + String(secondaryTempLimit, 2) + ",";
   json += "\"t2hy\":" + String(secondaryTempHysteresis, 2) + ",";
   json += "\"scrsv\":" + String(screenSaverEnabled ? "true" : "false") + ",";
-  json += "\"scrtm\":" + String(static_cast<unsigned long>(screenSaverTimeoutMs / 1000));
+  json += "\"scrtm\":" + String(static_cast<unsigned long>(screenSaverTimeoutMs / 60000)) + ",";
+  json += "\"scrtmMin\":" + String(screenSaverTimeoutMinMinutes) + ",";
+  json += "\"scrtmMax\":" + String(screenSaverTimeoutMaxMinutes) + ",";
+  json += "\"scrtmStep\":" + String(screenSaverTimeoutStepMinutes);
   json += "}";
   webServer.send(200, "application/json", json);
 }
@@ -1319,8 +1327,8 @@ void handleWebSettingsUpdate() {
   if (webServer.hasArg("t2hy")) secondaryTempHysteresis = webServer.arg("t2hy").toFloat();
   if (webServer.hasArg("scrsv")) screenSaverEnabled = (webServer.arg("scrsv") == "1");
   if (webServer.hasArg("scrtm")) {
-    long timeoutSec = webServer.arg("scrtm").toInt();
-    screenSaverTimeoutMs = static_cast<uint32_t>(timeoutSec) * 1000UL;
+    long timeoutMin = webServer.arg("scrtm").toInt();
+    screenSaverTimeoutMs = static_cast<uint32_t>(timeoutMin) * 60000UL;
   }
   sanitizeRuntimeSettings();
   saveSettings();
@@ -1678,7 +1686,7 @@ void updateDisplay() {
       display.printf("%s T2Mx: %.0f\xF8" "C\n", settingsSelection == 3 ? ">" : " ", secondaryTempLimit);
       display.printf("%s T2Hy: %.1f\xF8" "C\n", settingsSelection == 4 ? ">" : " ", secondaryTempHysteresis);
       display.printf("%s ScrSv: %s\n", settingsSelection == 5 ? ">" : " ", screenSaverEnabled ? "ON" : "OFF");
-      display.printf("%s ScrTm: %lus\n", settingsSelection == 6 ? ">" : " ", static_cast<unsigned long>(screenSaverTimeoutMs / 1000));
+      display.printf("%s ScrTm: %lumin\n", settingsSelection == 6 ? ">" : " ", static_cast<unsigned long>(screenSaverTimeoutMs / 60000));
       display.println();
       display.println(settingsEditing ? F("Mode: EDIT") : F("Mode: SELECT"));
       display.println(settingsEditing ? F("Rotate: adjust") : F("Rotate: choose"));

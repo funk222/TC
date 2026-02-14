@@ -14,12 +14,12 @@
 // Pin Configuration
 // ========================
 
-// MAX6675 Thermocouple Interface (3 pins)
+// MAX6675 Thermocouple Interface (T2 interlock, 3 pins)
 #define MAXDO   4   // SO pin (Serial Out)
 #define MAXCS   5   // CS pin (Chip Select)
 #define MAXCLK  6   // SCK pin (Serial Clock)
 
-// MAX31865 PT100 Interface (software SPI)
+// MAX31865 PT100 Interface (T1 primary control, software SPI)
 // Use available pins and share SCK/MISO with MAX6675 to avoid unavailable GPIO16/17
 #define PT100_CS    9       // CS pin
 #define PT100_MOSI  15      // SDI pin
@@ -33,11 +33,11 @@
 // Rotary Encoder (2 pins for rotation only)
 #define ENCODER_CLK 10  // CLK (A pin)
 #define ENCODER_DT  11  // DT (B pin)
-#define ENCODER_SW  21  // SW (Button) - used as confirm/select key
+#define ENCODER_SW  12  // SW (Button) - used as confirm/select key
 
 // Control Buttons (2 independent buttons)
-#define BTN_CONFIRM 12  // Menu key (open popup menu)
-#define BTN_BACK    13  // Back button
+#define BTN_CONFIRM 13  // Menu key (open popup menu)
+#define BTN_BACK    21  // Back button
 
 // Output Control (2 additional pins)
 #define RELAY_PIN   7   // Relay/SSR control for heater
@@ -66,10 +66,10 @@
 #define OLED_RESET      -1
 #define SCREEN_ADDRESS  0x3C  // Some displays use 0x3D
 #define SCREEN_SAVER_ENABLED true
-#define DEFAULT_SCREEN_SAVER_TIMEOUT_MS 60000   // Default auto turn off display timeout (ms)
-#define MIN_SCREEN_SAVER_TIMEOUT_MS     10000   // Minimum timeout (ms)
-#define MAX_SCREEN_SAVER_TIMEOUT_MS    600000   // Maximum timeout (ms)
-#define SCREEN_SAVER_TIMEOUT_STEP_MS    10000   // Timeout adjust step (ms)
+#define DEFAULT_SCREEN_SAVER_TIMEOUT_MS 600000   // Default auto turn off display timeout (ms)
+#define MIN_SCREEN_SAVER_TIMEOUT_MS     60000   // Minimum timeout (ms)
+#define MAX_SCREEN_SAVER_TIMEOUT_MS    6000000   // Maximum timeout (ms)
+#define SCREEN_SAVER_TIMEOUT_STEP_MS    60000   // Timeout adjust step (ms)
 
 // ========================
 // Network / Web Dashboard
@@ -77,7 +77,7 @@
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #define WIFI_CONNECT_TIMEOUT_MS 15000
-#define WEB_DASHBOARD_PORT 80
+#define WEB_DASHBOARD_PORT 80                                      
 #define WEB_STATUS_REFRESH_MS 2000
 #define WEB_LOG_INTERVAL_MS 10000
 #define LOG_MAX_FILE_SIZE 65536
@@ -103,7 +103,7 @@
 #define MAX_TEMP             85.0  // Maximum settable temp
 #define TEMP_ADJUST_STEP     0.5    // Adjustment step per encoder click
 
-// Second temperature sensor (MAX31865 + PT100)
+// T2 interlock settings
 #define DEFAULT_SECOND_SENSOR_MAX_TEMP 150.0  // Interlock threshold default (°C)
 #define SECOND_SENSOR_HYSTERESIS        2.0    // Interlock hysteresis (°C), release at (T2Lim - Hys)
 #define MIN_SECOND_SENSOR_HYSTERESIS    0.0    // T2 hysteresis min (°C)
