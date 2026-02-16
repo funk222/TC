@@ -202,3 +202,7 @@ pio run -e esp8266-hw-364a -t upload
 ## 📄 License
 
 MIT
+
+## 📝 更新说明
+
+- 版本更新记录见：`CHANGELOG.md`
