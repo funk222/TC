@@ -74,8 +74,20 @@
 // ========================
 // Network / Web Dashboard
 // ========================
-#define WIFI_SSID "REDACTED_SSID"
-#define WIFI_PASSWORD "REDACTED_PASSWORD"
+#if defined(__has_include)
+#  if __has_include("config_secrets.h")
+#    include "config_secrets.h"
+#  endif
+#endif
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 #define WEB_DASHBOARD_PORT 80                                      
 #define WEB_STATUS_REFRESH_MS 2000

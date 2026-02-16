@@ -155,8 +155,9 @@ pio run -e esp8266-hw-364a -t upload
 
 ## 🌐 网页状态页
 
-- 设备会以 STA 模式连接到 `include/config.h` 中配置的 `WIFI_SSID`
-- Wi-Fi 密码来自 `include/config.h` 中配置的 `WIFI_PASSWORD`
+- 设备会以 STA 模式连接到本地私有文件 `include/config_secrets.h` 中配置的 `WIFI_SSID`
+- Wi-Fi 密码来自本地私有文件 `include/config_secrets.h` 中配置的 `WIFI_PASSWORD`
+- 首次配置：复制 `include/config_secrets.h.example` 为 `include/config_secrets.h` 并填写你的真实 Wi‑Fi 信息（该文件已被 `.gitignore` 忽略）
 - 上电后在串口日志查看 `IP`，浏览器访问：`http://<设备IP>/`
 - JSON 接口：`http://<设备IP>/api/status`
 - 同步接口：`http://<设备IP>/api/sync/status`（可选 `?key=...`）

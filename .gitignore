@@ -1,5 +1,7 @@
 .pio/
 .vscode/
+include/config_secrets.h
+src/receiver_secrets.h
 
 # Python env/cache (if any)
 __pycache__/

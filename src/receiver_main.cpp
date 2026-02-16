@@ -5,15 +5,30 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#if defined(__has_include)
+#  if __has_include("receiver_secrets.h")
+#    include "receiver_secrets.h"
+#  endif
+#endif
+
 // ====== User Config ======
-const char* WIFI_SSID = "REDACTED_SSID";
-const char* WIFI_PASSWORD = "REDACTED_PASSWORD";
+#ifndef RECEIVER_WIFI_SSID
+#define RECEIVER_WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+
+#ifndef RECEIVER_WIFI_PASSWORD
+#define RECEIVER_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
 const char* PRIMARY_IP = "192.168.4.111";  // Main controller IP
 const uint16_t PRIMARY_PORT = 80;
 const char* SYNC_KEY = ""; // Must match WIFI_SYNC_API_KEY in primary config.h
 const unsigned long SYNC_INTERVAL_MS = 1000;
 const unsigned long DISPLAY_REFRESH_MS = 100;
 const unsigned long BLINK_INTERVAL_MS = 300;
+
+const char* WIFI_SSID = RECEIVER_WIFI_SSID;
+const char* WIFI_PASSWORD = RECEIVER_WIFI_PASSWORD;
 
 // HW-364A OLED (SSD1306, 128x64)
 static const int SCREEN_WIDTH = 128;
