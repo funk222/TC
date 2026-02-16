@@ -118,6 +118,7 @@ uint32_t screenSaverTimeoutMs = DEFAULT_SCREEN_SAVER_TIMEOUT_MS;
 unsigned long lastUserActivityMs = 0;
 int screenSaverEncoderPos = 0;
 unsigned long lastWebLogWriteMs = 0;
+const unsigned long encoderLongPressMs = 800;
 
 const int MAIN_TOTAL_LINES = 4;
 
@@ -179,6 +180,7 @@ void initWiFi();
 void setupWebServer();
 void handleWebRoot();
 void handleWebStatus();
+void handleWebSyncStatus();
 void handleWebControl();
 void handleWebLogDownload();
 void handleWebLogClear();
@@ -196,6 +198,7 @@ void markWebLoginFailure(const String& ip);
 void markWebLoginSuccess(const String& ip);
 void markWebLogout(const String& ip);
 bool ensureAuthenticated();
+bool ensureSyncApiAccess();
 String jsonEscape(const String& input);
 void rotateLogsIfNeeded();
 void formatLogDateAndTime(String& datePart, String& timePart);
@@ -262,8 +265,6 @@ void setup() {
   if (ENCODER_SW >= 0) {
     pinMode(ENCODER_SW, INPUT_PULLUP);  // 编码器按键（备用）
   }
-  pinMode(BTN_CONFIRM, INPUT_PULLUP); // 确认键（主要）
-  pinMode(BTN_BACK, INPUT_PULLUP);    // 返回键
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
@@ -290,7 +291,7 @@ void setup() {
   } else {
     Serial.printf("编码器: CLK=%d, DT=%d, SW=未使用\n", ENCODER_CLK, ENCODER_DT);
   }
-  Serial.printf("按键: CONFIRM=%d, BACK=%d\n", BTN_CONFIRM, BTN_BACK);
+  Serial.println("按键: 使用编码器按键(SW), 长按进菜单/返回");
   Serial.printf("继电器: HEATER=%d\n", RELAY_PIN);
   Serial.printf("RGB LED: PIN=%d (板载WS2812)\n", RGB_LED_PIN);
   #endif
@@ -397,10 +398,12 @@ void IRAM_ATTR encoderISR() {
 }
 
 void handleButtons() {
+  static bool encoderSwPressed = false;
+  static bool encoderSwLongHandled = false;
+  static unsigned long encoderSwPressedAt = 0;
+
   unsigned long currentTime = millis();
-  bool wakeInput = (digitalRead(BTN_CONFIRM) == LOW)
-                  || (digitalRead(BTN_BACK) == LOW)
-                  || (ENCODER_SW >= 0 && digitalRead(ENCODER_SW) == LOW)
+  bool wakeInput = (ENCODER_SW >= 0 && digitalRead(ENCODER_SW) == LOW)
                   || (encoderPos != screenSaverEncoderPos);
 
   if (screenSaverActive) {
@@ -409,8 +412,6 @@ void handleButtons() {
       display.ssd1306_command(SSD1306_DISPLAYON);
       lastUserActivityMs = currentTime;
       screenSaverEncoderPos = encoderPos;
-      lastBtnConfirmTime = currentTime;
-      lastBtnBackTime = currentTime;
       lastBtnEncoderSwTime = currentTime;
       updateDisplay();
     }
@@ -422,112 +423,24 @@ void handleButtons() {
     screenSaverEncoderPos = encoderPos;
   }
 
-  // 菜单按键（原 CONFIRM 键）
-  if (digitalRead(BTN_CONFIRM) == LOW) {
-    if (currentTime - lastBtnConfirmTime > btnDebounceDelay) {
-      lastBtnConfirmTime = currentTime;
+  if (ENCODER_SW < 0) return;
+
+  bool isPressed = (digitalRead(ENCODER_SW) == LOW);
+
+  if (isPressed) {
+    if (!encoderSwPressed) {
+      encoderSwPressed = true;
+      encoderSwLongHandled = false;
+      encoderSwPressedAt = currentTime;
+    }
+
+    if (!encoderSwLongHandled && (currentTime - encoderSwPressedAt >= encoderLongPressMs)) {
+      encoderSwLongHandled = true;
+
       if (currentMenu == MENU_MAIN) {
         currentMenu = MENU_POPUP;
         menuSelection = 0;
-      }
-    }
-  }
-
-  // 编码器按键（确认/选择）
-  if (ENCODER_SW >= 0 && digitalRead(ENCODER_SW) == LOW) {
-    if (currentTime - lastBtnEncoderSwTime > btnDebounceDelay) {
-      lastBtnEncoderSwTime = currentTime;
-
-      switch (currentMenu) {
-        case MENU_POPUP:
-          // 在弹出菜单执行操作
-          if (menuSelection == 0) currentMenu = MENU_SET_TARGET;
-          else if (menuSelection == 1) {
-            pendingAction = ACTION_TOGGLE_SYS;
-            currentMenu = MENU_CONFIRM_ACTION;
-          }
-          else if (menuSelection == 2) {
-            currentMenu = MENU_SETTINGS;
-            settingsSelection = 0;
-            settingsEditing = false;
-          }
-          else if (menuSelection == 3) {
-            pendingAction = ACTION_FACTORY_RESET;
-            currentMenu = MENU_CONFIRM_ACTION;
-          }
-          break;
-
-        case MENU_CONFIRM_ACTION:
-          if (pendingAction == ACTION_TOGGLE_SYS) {
-            systemEnabled = !systemEnabled;
-            saveSettings();
-            #if ENABLE_SERIAL_DEBUG
-            Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
-            #endif
-            currentMenu = MENU_POPUP;
-          } else if (pendingAction == ACTION_FACTORY_RESET) {
-            factoryResetSettings();
-            #if ENABLE_SERIAL_DEBUG
-            Serial.println("已恢复出厂设置");
-            #endif
-            currentMenu = MENU_MAIN;
-          }
-          pendingAction = ACTION_NONE;
-          break;
-
-        case MENU_SET_TARGET:
-          // 确认目标温度
-          saveSettings();
-          currentMenu = MENU_MAIN;
-          menuSelection = 0;
-          #if ENABLE_SERIAL_DEBUG
-          Serial.printf("目标温度设定为: %.1f°C\n", targetTemp);
-          #endif
-          break;
-
-        case MENU_SYSTEM_CONTROL:
-          // 切换系统开关
-          systemEnabled = !systemEnabled;
-          #if ENABLE_SERIAL_DEBUG
-          Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
-          #endif
-          break;
-
-        case MENU_SETTINGS:
-          // ScrSv 项支持一键切换（无需进入编辑模式）
-          if (!settingsEditing && settingsSelection == 5) {
-            screenSaverEnabled = !screenSaverEnabled;
-            saveSettings();
-            #if ENABLE_SERIAL_DEBUG
-            Serial.printf("屏保 %s\n", screenSaverEnabled ? "开启" : "关闭");
-            #endif
-            break;
-          }
-
-          // 其他项：确认键进入/退出编辑模式
-          settingsEditing = !settingsEditing;
-          if (!settingsEditing) {
-            saveSettings();
-          }
-          #if ENABLE_SERIAL_DEBUG
-          if (!settingsEditing) {
-            Serial.printf("设置已更新: Hys=%.1f°C, Low=%.1f°C, High=%.1f°C\n", tempHysteresis, safetyLowerTemp, safetyUpperTemp);
-          }
-          #endif
-          break;
-
-        default:
-          break;
-      }
-    }
-  }
-
-  // 返回按钮
-  if (digitalRead(BTN_BACK) == LOW) {
-    if (currentTime - lastBtnBackTime > btnDebounceDelay) {
-      lastBtnBackTime = currentTime;
-      
-      if (currentMenu != MENU_MAIN) {
+      } else {
         if (currentMenu == MENU_SETTINGS && settingsEditing) {
           settingsEditing = false;
           saveSettings();
@@ -539,11 +452,108 @@ void handleButtons() {
         } else {
           currentMenu = MENU_POPUP;
         }
-        #if ENABLE_SERIAL_DEBUG
-        Serial.println("返回上级菜单");
-        #endif
       }
+
+      #if ENABLE_SERIAL_DEBUG
+      Serial.println("编码器长按: 菜单操作");
+      #endif
     }
+    return;
+  }
+
+  if (!encoderSwPressed) return;
+
+  bool wasLongPress = encoderSwLongHandled;
+  encoderSwPressed = false;
+  encoderSwLongHandled = false;
+
+  if (wasLongPress) {
+    lastBtnEncoderSwTime = currentTime;
+    return;
+  }
+
+  if (currentTime - lastBtnEncoderSwTime <= btnDebounceDelay) {
+    return;
+  }
+
+  lastBtnEncoderSwTime = currentTime;
+
+  // 编码器短按（确认/选择）
+  switch (currentMenu) {
+    case MENU_POPUP:
+      if (menuSelection == 0) currentMenu = MENU_SET_TARGET;
+      else if (menuSelection == 1) {
+        pendingAction = ACTION_TOGGLE_SYS;
+        currentMenu = MENU_CONFIRM_ACTION;
+      }
+      else if (menuSelection == 2) {
+        currentMenu = MENU_SETTINGS;
+        settingsSelection = 0;
+        settingsEditing = false;
+      }
+      else if (menuSelection == 3) {
+        pendingAction = ACTION_FACTORY_RESET;
+        currentMenu = MENU_CONFIRM_ACTION;
+      }
+      break;
+
+    case MENU_CONFIRM_ACTION:
+      if (pendingAction == ACTION_TOGGLE_SYS) {
+        systemEnabled = !systemEnabled;
+        saveSettings();
+        #if ENABLE_SERIAL_DEBUG
+        Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
+        #endif
+        currentMenu = MENU_POPUP;
+      } else if (pendingAction == ACTION_FACTORY_RESET) {
+        factoryResetSettings();
+        #if ENABLE_SERIAL_DEBUG
+        Serial.println("已恢复出厂设置");
+        #endif
+        currentMenu = MENU_MAIN;
+      }
+      pendingAction = ACTION_NONE;
+      break;
+
+    case MENU_SET_TARGET:
+      saveSettings();
+      currentMenu = MENU_MAIN;
+      menuSelection = 0;
+      #if ENABLE_SERIAL_DEBUG
+      Serial.printf("目标温度设定为: %.1f°C\n", targetTemp);
+      #endif
+      break;
+
+    case MENU_SYSTEM_CONTROL:
+      systemEnabled = !systemEnabled;
+      #if ENABLE_SERIAL_DEBUG
+      Serial.printf("系统 %s\n", systemEnabled ? "开启" : "关闭");
+      #endif
+      break;
+
+    case MENU_SETTINGS:
+      if (!settingsEditing && settingsSelection == 5) {
+        screenSaverEnabled = !screenSaverEnabled;
+        saveSettings();
+        #if ENABLE_SERIAL_DEBUG
+        Serial.printf("屏保 %s\n", screenSaverEnabled ? "开启" : "关闭");
+        #endif
+        break;
+      }
+
+      settingsEditing = !settingsEditing;
+      if (!settingsEditing) {
+        saveSettings();
+      }
+      #if ENABLE_SERIAL_DEBUG
+      if (!settingsEditing) {
+        Serial.printf("设置已更新: Hys=%.1f°C, Low=%.1f°C, High=%.1f°C\n", tempHysteresis, safetyLowerTemp, safetyUpperTemp);
+      }
+      #endif
+      break;
+
+    default:
+      break;
   }
 }
 
@@ -558,7 +568,6 @@ void handleMenuNavigation() {
 
     switch (currentMenu) {
       case MENU_MAIN:
-        // 首页滚屏
         mainScrollOffset += delta;
         if (mainScrollOffset < 0) mainScrollOffset = 0;
         {
@@ -567,7 +576,7 @@ void handleMenuNavigation() {
             totalHeight += (lineIndex <= 2) ? 16 : 8;
           }
           if (MAIN_TOTAL_LINES > 1) {
-            totalHeight += 2; // separator under second large line
+            totalHeight += 2;
           }
 
           int maxScroll = 0;
@@ -580,14 +589,12 @@ void handleMenuNavigation() {
         break;
 
       case MENU_POPUP:
-        // 弹出菜单导航
         menuSelection += (delta > 0) ? 1 : -1;
         if (menuSelection < 0) menuSelection = 3;
         if (menuSelection > 3) menuSelection = 0;
         break;
-        
+
       case MENU_SET_TARGET:
-        // 调节目标温度
         targetTemp += delta * TEMP_ADJUST_STEP;
         {
           float targetMin = (safetyLowerTemp > MIN_TEMP) ? safetyLowerTemp : MIN_TEMP;
@@ -596,54 +603,45 @@ void handleMenuNavigation() {
           if (targetTemp > targetMax) targetTemp = targetMax;
         }
         break;
-        
+
       case MENU_SYSTEM_CONTROL:
-        // 保留给未来扩展
         break;
-        
+
       case MENU_SETTINGS:
         if (settingsEditing) {
           if (settingsSelection == 0) {
-            // 调节滞后参数
             tempHysteresis += delta * HYSTERESIS_ADJUST_STEP;
             if (tempHysteresis < MIN_HYSTERESIS) tempHysteresis = MIN_HYSTERESIS;
             if (tempHysteresis > MAX_HYSTERESIS) tempHysteresis = MAX_HYSTERESIS;
           } else if (settingsSelection == 1) {
-            // 调节安全下限
             safetyLowerTemp += delta * SAFETY_BOUNDARY_STEP;
             if (safetyLowerTemp < SAFETY_BOUNDARY_MIN) safetyLowerTemp = SAFETY_BOUNDARY_MIN;
             if (safetyLowerTemp > safetyUpperTemp - MIN_SAFE_RANGE_GAP) {
               safetyLowerTemp = safetyUpperTemp - MIN_SAFE_RANGE_GAP;
             }
           } else if (settingsSelection == 2) {
-            // 调节安全上限
             safetyUpperTemp += delta * SAFETY_BOUNDARY_STEP;
             if (safetyUpperTemp > SAFETY_BOUNDARY_MAX) safetyUpperTemp = SAFETY_BOUNDARY_MAX;
             if (safetyUpperTemp < safetyLowerTemp + MIN_SAFE_RANGE_GAP) {
               safetyUpperTemp = safetyLowerTemp + MIN_SAFE_RANGE_GAP;
             }
           } else if (settingsSelection == 3) {
-            // 调节 T2 联锁上限
             secondaryTempLimit += delta * SECOND_SENSOR_MAX_STEP;
             if (secondaryTempLimit < MIN_SECOND_SENSOR_MAX_TEMP) secondaryTempLimit = MIN_SECOND_SENSOR_MAX_TEMP;
             if (secondaryTempLimit > MAX_SECOND_SENSOR_MAX_TEMP) secondaryTempLimit = MAX_SECOND_SENSOR_MAX_TEMP;
           } else if (settingsSelection == 4) {
-            // 调节 T2 联锁回差
             secondaryTempHysteresis += delta * SECOND_SENSOR_HYSTERESIS_STEP;
             if (secondaryTempHysteresis < MIN_SECOND_SENSOR_HYSTERESIS) secondaryTempHysteresis = MIN_SECOND_SENSOR_HYSTERESIS;
             if (secondaryTempHysteresis > MAX_SECOND_SENSOR_HYSTERESIS) secondaryTempHysteresis = MAX_SECOND_SENSOR_HYSTERESIS;
           } else if (settingsSelection == 5) {
-            // 屏幕保护开关
             if (delta != 0) screenSaverEnabled = !screenSaverEnabled;
           } else if (settingsSelection == 6) {
-            // 屏幕保护时长（分钟步进，内部毫秒）
             int32_t nextValue = static_cast<int32_t>(screenSaverTimeoutMs) + (delta * SCREEN_SAVER_TIMEOUT_STEP_MS);
             if (nextValue < MIN_SCREEN_SAVER_TIMEOUT_MS) nextValue = MIN_SCREEN_SAVER_TIMEOUT_MS;
             if (nextValue > MAX_SCREEN_SAVER_TIMEOUT_MS) nextValue = MAX_SCREEN_SAVER_TIMEOUT_MS;
             screenSaverTimeoutMs = static_cast<uint32_t>(nextValue);
           }
 
-          // 目标温度始终限制在安全范围内
           {
             float targetMin = (safetyLowerTemp > MIN_TEMP) ? safetyLowerTemp : MIN_TEMP;
             float targetMax = (safetyUpperTemp < MAX_TEMP) ? safetyUpperTemp : MAX_TEMP;
@@ -651,7 +649,6 @@ void handleMenuNavigation() {
             if (targetTemp > targetMax) targetTemp = targetMax;
           }
         } else {
-          // 未编辑时，旋钮切换设置项
           settingsSelection += (delta > 0) ? 1 : -1;
           if (settingsSelection < 0) settingsSelection = 6;
           if (settingsSelection > 6) settingsSelection = 0;
@@ -935,6 +932,9 @@ void setupWebServer() {
   webServer.on("/api/auth/login", HTTP_POST, handleWebAuthLogin);
   webServer.on("/api/auth/logout", HTTP_POST, handleWebAuthLogout);
   webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  if (WIFI_SYNC_ENDPOINT_ENABLED) {
+    webServer.on("/api/sync/status", HTTP_GET, handleWebSyncStatus);
+  }
   webServer.on("/api/settings", HTTP_GET, handleWebSettings);
   webServer.on("/api/settings/update", HTTP_POST, handleWebSettingsUpdate);
   webServer.on("/api/control", HTTP_GET, handleWebControl);
@@ -1312,6 +1312,25 @@ void handleWebStatus() {
   webServer.send(200, "application/json", json);
 }
 
+void handleWebSyncStatus() {
+  if (!ensureSyncApiAccess()) return;
+
+  String json = "{";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"t1\":" + String(currentTemp, 2) + ",";
+  json += "\"target\":" + String(targetTemp, 2) + ",";
+  json += "\"t2Valid\":" + String(secondarySensorValid ? "true" : "false") + ",";
+  json += "\"t2\":" + (secondarySensorValid ? String(secondaryTemp, 2) : String("null")) + ",";
+  json += "\"heaterOn\":" + String(heaterOn ? "true" : "false") + ",";
+  json += "\"systemEnabled\":" + String(systemEnabled ? "true" : "false") + ",";
+  json += "\"safeLow\":" + String(safetyLowerTemp, 2) + ",";
+  json += "\"safeHigh\":" + String(safetyUpperTemp, 2) + ",";
+  json += "\"t2Limit\":" + String(secondaryTempLimit, 2);
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
 void handleWebSettings() {
   if (!ensureAuthenticated()) return;
 
@@ -1521,6 +1540,20 @@ bool ensureAuthenticated() {
 
   if (!isWebClientLoggedIn(ip)) {
     webServer.send(401, "application/json", "{\"ok\":false,\"message\":\"Authentication required\"}");
+    return false;
+  }
+
+  return true;
+}
+
+bool ensureSyncApiAccess() {
+  String syncApiKey = WIFI_SYNC_API_KEY;
+  if (syncApiKey.length() == 0) {
+    return true;
+  }
+
+  if (!webServer.hasArg("key") || webServer.arg("key") != syncApiKey) {
+    webServer.send(401, "application/json", "{\"ok\":false,\"message\":\"Invalid sync key\"}");
     return false;
   }
 

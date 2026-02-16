@@ -17,6 +17,7 @@
 - ✅ 编码器抗抖优化：四相状态表解码 + 整卡点计步，菜单选择更稳定
 - ✅ RGB LED 报警序列
 - ✅ 内置网页状态页（实时显示 T1/T2/Heat/Sys）
+- ✅ WiFi 同步接口（供副ESP32镜像显示状态）
 - ✅ 网页控制（SYS 开关、目标温度设置）+ 日志下载
 - ✅ 日志文件自动轮转（超大小自动删除旧日志）
 
@@ -138,12 +139,27 @@ pio run -e esp32-c6-devkitc-1 -t upload
 pio device monitor
 ```
 
+### 🔁 同仓库切换编译目标
+
+```bash
+# 主控（温控器）
+pio run -e esp32-c6-devkitc-1
+pio run -e esp32-c6-devkitc-1 -t upload
+
+# 副机（WiFi镜像显示）
+pio run -e esp8266-hw-364a
+pio run -e esp8266-hw-364a -t upload
+```
+
+副机源码入口：`src/receiver_main.cpp`
+
 ## 🌐 网页状态页
 
 - 设备会以 STA 模式连接到 `include/config.h` 中配置的 `WIFI_SSID`
 - Wi-Fi 密码来自 `include/config.h` 中配置的 `WIFI_PASSWORD`
 - 上电后在串口日志查看 `IP`，浏览器访问：`http://<设备IP>/`
 - JSON 接口：`http://<设备IP>/api/status`
+- 同步接口：`http://<设备IP>/api/sync/status`（可选 `?key=...`）
 - 控制接口：`/api/control?sys=on|off|toggle`、`/api/control?target=xx.x`
 - 设置接口：`/api/settings`、`/api/settings/update`（含 `hys/low/high/t2max/t2hy/scrsv/scrtm`）
 - 日志下载：`http://<设备IP>/logs/download`
@@ -153,6 +169,12 @@ pio device monitor
 - CSV 包含表头首行：`date,time,T1,T1set,T2,Heat`
 - 时间格式：日期 `yyyy/mm/dd`，时间 `hh:mm:ss`
 - 若 NTP 时间未同步，日期回退为 `1970/01/01`，时间使用运行时 `hh:mm:ss`
+
+### 📡 副ESP32镜像显示
+
+- 文档：`docs/ESP32_WIFI_SYNC.md`
+- 副机示例：`docs/ESP32_WIFI_MIRROR_RECEIVER.ino`
+- 主机可在 `include/config.h` 设置：`WIFI_SYNC_ENDPOINT_ENABLED`、`WIFI_SYNC_API_KEY`
 
 ### 🔐 网页安全访问
 

@@ -74,8 +74,8 @@
 // ========================
 // Network / Web Dashboard
 // ========================
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID "REDACTED_SSID"
+#define WIFI_PASSWORD "REDACTED_PASSWORD"
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 #define WEB_DASHBOARD_PORT 80                                      
 #define WEB_STATUS_REFRESH_MS 2000
@@ -83,6 +83,10 @@
 #define LOG_MAX_FILE_SIZE 65536
 #define WEB_AUTH_MAX_FAILS 5
 #define WEB_AUTH_BLOCK_MS 300000
+
+// Secondary ESP32 status mirror API
+#define WIFI_SYNC_ENDPOINT_ENABLED true
+#define WIFI_SYNC_API_KEY ""  // Empty = no key check on /api/sync/status
 
 // ========================
 // Temperature Control
